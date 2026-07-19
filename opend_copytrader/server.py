@@ -186,6 +186,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     )
                 self.server.app.moonvest_stream.wake()
                 return self._json(result)
+            if path == "/api/moonvest/cursor":
+                return self._json(
+                    self.server.app.moonvest_stream.replace_cursor(payload.get("cursor"))
+                )
             if path == "/api/robinhood/oauth/start":
                 authorization_url = self.server.app.adapter.robinhood_authorization_url()
                 opened = webbrowser.open(authorization_url)

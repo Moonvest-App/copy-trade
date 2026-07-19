@@ -17,6 +17,7 @@ Accept: text/event-stream
 - API key 不进入 `settings.json`、SQLite、日志、App 或分享包。
 - cursor 在每个事件完整处理后写入本机 SQLite。
 - 默认以 `Last-Event-ID` 恢复，也可切换为 `since=<id>`。
+- 可在连接页粘贴一个已知 cursor 立即回放；follow 用户名会规范为 Moonvest 要求的小写，避免大小写不匹配造成静默空流。
 - 本机信号表对 `source + event id` 建立唯一约束；重投事件不会再次执行。
 - 在券商接口支持自定义订单标识时，订单 remark 使用事件 id 的稳定摘要；本机数据库始终用事件 id 保证持久幂等。
 - `: keepalive` 注释会被忽略。

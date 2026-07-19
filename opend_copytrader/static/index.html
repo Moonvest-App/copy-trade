@@ -90,11 +90,13 @@
             <p class="section-note">唯一开单信息源固定为 Moonvest SSE。每条连接最多跟随两个明确用户名；断线时使用持久 cursor 自动补齐缺口。</p>
             <div class="endpoint-box"><span>固定端点</span><code>GET https://stream.moonvest.app/v1/active_trades/subscribe</code></div>
             <div class="form-grid source-config">
-              <label class="field wide"><span>Follow 用户（最多 2 个，逗号分隔）</span><input name="moonvest_follow" placeholder="alice, bob" autocomplete="off" spellcheck="false"></label>
+              <label class="field wide"><span>Follow 用户（最多 2 个，自动转为小写，逗号分隔）</span><input name="moonvest_follow" placeholder="alice, bob" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
               <label class="field"><span>Cursor 重连方式</span><select name="moonvest_cursor_mode"><option value="header">Last-Event-ID 请求头</option><option value="since">since 查询参数</option></select></label>
               <label class="field"><span>API key（只写入钥匙串）</span><input id="moonvest-api-key" class="secret-input" type="password" autocomplete="off" spellcheck="false" placeholder="留空表示不更改"></label>
+              <label class="field wide"><span>恢复 cursor（可粘贴；留空表示 live tail）</span><input id="moonvest-cursor-input" data-runtime-field autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="例如 6a5ac2000000000000000000"></label>
             </div>
             <div class="credential-actions"><button id="save-moonvest-key" type="button" class="btn primary">保存 API key</button><button id="clear-moonvest-key" type="button" class="btn text-danger">清除 API key</button><span id="moonvest-credential-status">尚未保存</span></div>
+            <div class="credential-actions"><button id="apply-moonvest-cursor" type="button" class="btn ghost">从此 cursor 回放</button><button id="clear-moonvest-cursor" type="button" class="btn text-danger">清空 cursor</button><span>应用后会关闭订单执行并立即重连</span></div>
             <div id="moonvest-detail" class="detail-box">等待读取连接状态</div>
           </article>
 

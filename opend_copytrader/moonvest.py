@@ -36,6 +36,14 @@ class MoonvestProtocolError(MoonvestError):
     pass
 
 
+def normalize_cursor(value: Any) -> str:
+    """Validate a user-supplied replay cursor without assuming its ID format."""
+    cursor = str(value or "").strip()
+    if len(cursor) > 512 or any(char in cursor for char in "\r\n\x00"):
+        raise ValueError("Moonvest cursor 格式无效")
+    return cursor
+
+
 @dataclass(frozen=True, slots=True)
 class SSEFrame:
     event: str
@@ -374,6 +382,7 @@ class MoonvestStream:
         self._thread: threading.Thread | None = None
         self._response: Any = None
         self._status_lock = threading.RLock()
+        self._reconnect_generation = 0
         self._status: dict[str, Any] = {
             "endpoint": MOONVEST_ENDPOINT,
             "connected": False,
@@ -404,12 +413,34 @@ class MoonvestStream:
 
     def wake(self) -> None:
         self._wake.set()
-        response, self._response = self._response, None
+        with self._status_lock:
+            self._reconnect_generation += 1
+            response, self._response = self._response, None
         if response is not None:
             try:
                 response.close()
             except Exception:
                 pass
+
+    def replace_cursor(self, value: Any) -> dict[str, Any]:
+        """Persist a replay cursor (or clear it) and reconnect safely."""
+        cursor = normalize_cursor(value)
+        self.engine.disarm()
+        self.store.set_meta(CURSOR_META_KEY, cursor)
+        self._set_status(last_error="", last_event_at=None, resync_required=False)
+        if cursor:
+            self.store.event(
+                "moonvest.cursor_updated",
+                "Moonvest 恢复 cursor 已更新；订单执行已关闭并将从该位置回放",
+                details={"cursor_suffix": cursor[-12:]},
+            )
+        else:
+            self.store.event(
+                "moonvest.cursor_cleared",
+                "Moonvest cursor 已清空；订单执行已关闭并将从 live tail 继续",
+            )
+        self.wake()
+        return self.status()
 
     def status(self) -> dict[str, Any]:
         with self._status_lock:
@@ -436,8 +467,10 @@ class MoonvestStream:
                 self._wait(3)
                 continue
             try:
-                self._session(api_key)
+                reconfigured = self._session(api_key)
                 delay = 1.0
+                if reconfigured:
+                    continue
                 if not self._stop.is_set():
                     raise ConnectionError("Moonvest SSE 连接已结束")
             except urllib.error.HTTPError as exc:
@@ -473,15 +506,17 @@ class MoonvestStream:
                 details={"reason": reason[:500]},
             )
 
-    def _session(self, api_key: str) -> None:
+    def _session(self, api_key: str) -> bool:
+        with self._status_lock:
+            generation = self._reconnect_generation
         settings = self.settings.get()
-        cursor = self.store.get_meta(CURSOR_META_KEY)
+        cursor = normalize_cursor(self.store.get_meta(CURSOR_META_KEY))
         params: list[tuple[str, str]] = [("follow", username) for username in settings.moonvest_follow]
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
-            "User-Agent": "Moonvest/1.1.0",
+            "User-Agent": "Moonvest/1.1.1",
         }
         if cursor:
             if settings.moonvest_cursor_mode == "since":
@@ -492,11 +527,18 @@ class MoonvestStream:
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with self._opener(request, timeout=90) as response:
-                self._response = response
+                with self._status_lock:
+                    self._response = response
+                    superseded = generation != self._reconnect_generation
+                if superseded:
+                    return True
                 self._set_status(connected=True, last_error="")
                 for frame in iter_sse_frames(response):
                     if self._stop.is_set():
-                        return
+                        return False
+                    with self._status_lock:
+                        if generation != self._reconnect_generation:
+                            return True
                     if frame.event == "resync":
                         self._handle_resync(frame)
                     elif frame.event == "trade":
@@ -507,8 +549,11 @@ class MoonvestStream:
                             f"已忽略未知 SSE event：{frame.event}",
                             level="warning",
                         )
+                with self._status_lock:
+                    return generation != self._reconnect_generation
         finally:
-            self._response = None
+            with self._status_lock:
+                self._response = None
 
     def _handle_trade(self, frame: SSEFrame) -> None:
         try:

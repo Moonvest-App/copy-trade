@@ -131,12 +131,14 @@ class AppSettings:
         result: list[str] = []
         seen: set[str] = set()
         for raw in values:
-            username = str(raw or "").strip().removeprefix("@")
+            # Moonvest's follow query is case-sensitive and usernames are
+            # canonical lowercase. Normalize here so a UI value such as
+            # "BOKUTO" cannot silently subscribe to an empty stream.
+            username = str(raw or "").strip().removeprefix("@").casefold()
             if not FOLLOW_RE.fullmatch(username):
                 raise ValueError("Moonvest 用户名只能包含字母、数字、点、下划线或连字符")
-            identity = username.casefold()
-            if identity not in seen:
-                seen.add(identity)
+            if username not in seen:
+                seen.add(username)
                 result.append(username)
         if len(result) > 2:
             raise ValueError("每条 Moonvest SSE 连接最多允许 2 个 follow 用户")

@@ -356,6 +356,41 @@ class MoonvestStreamTest(unittest.TestCase):
         self.assertIn("since=cursor-9", requests[0].full_url)
         self.assertIsNone(requests[0].headers.get("Last-event-id"))
 
+    def test_replace_cursor_persists_disarms_and_wakes_replay(self):
+        self.settings.update({"moonvest_cursor_mode": "since", "mode": "confirm", "account_id": 123})
+        self.engine.arm()
+        stream = MoonvestStream(self.settings, self.store, self.engine, FakeCredentials())
+        status = stream.replace_cursor(" 6a5ac2000000000000000000 ")
+        self.assertEqual(self.store.get_meta(CURSOR_META_KEY), "6a5ac2000000000000000000")
+        self.assertEqual(status["cursor"], "6a5ac2000000000000000000")
+        self.assertFalse(self.engine.state()["armed"])
+        self.assertTrue(stream._wake.is_set())
+
+        cleared = stream.replace_cursor("")
+        self.assertEqual(cleared["cursor"], "")
+        self.assertEqual(self.store.get_meta(CURSOR_META_KEY), "")
+
+    def test_cursor_change_during_connect_forces_request_rebuild(self):
+        requests = []
+        stream = None
+
+        def opener(request, timeout=0):
+            requests.append(request)
+            if len(requests) == 1:
+                stream.replace_cursor("cursor-during-connect")
+            return FakeStreamResponse([])
+
+        self.settings.update({"moonvest_cursor_mode": "since"})
+        stream = MoonvestStream(self.settings, self.store, self.engine, FakeCredentials(), opener=opener)
+        self.assertTrue(stream._session("test-key"))
+        self.assertFalse(stream._session("test-key"))
+        self.assertNotIn("since=", requests[0].full_url)
+        self.assertIn("since=cursor-during-connect", requests[1].full_url)
+
+    def test_follow_usernames_are_normalized_to_lowercase(self):
+        settings = self.settings.update({"moonvest_follow": ["@BOKUTO", "BoKuTo"]})
+        self.assertEqual(settings.moonvest_follow, ["bokuto"])
+
     def test_resync_marks_state_stale_clears_cursor_and_disarms(self):
         payload = normalize_trade_payload(stock_event("existing"))
         self.store.upsert_moonvest_position(moonvest_position_key(payload), payload)

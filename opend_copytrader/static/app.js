@@ -121,6 +121,10 @@ function renderMoonvest(status) {
     credential.className = status.api_key_configured ? "ready" : "";
     credential.textContent = status.api_key_configured ? `已配置 · ${status.credential_source === "environment" ? "环境变量" : "macOS 钥匙串"}` : "尚未保存 API key";
   }
+  const cursorInput = $("#moonvest-cursor-input");
+  if (cursorInput && document.activeElement !== cursorInput && cursorInput.dataset.edited !== "true") {
+    cursorInput.value = status.cursor || "";
+  }
   const detail = $("#moonvest-detail");
   if (detail) {
     const last = status.last_event_at ? `上次事件 ${shortTime(status.last_event_at, true)}` : "尚未收到事件";
@@ -254,6 +258,27 @@ async function clearMoonvestKey() {
   if (!window.confirm("确定从 macOS 登录钥匙串清除 Moonvest API key 吗？")) return;
   await mutate("/api/moonvest/credentials", { clear: true });
   toast("Moonvest API key 已清除");
+  await loadDashboard(true);
+}
+
+async function applyMoonvestCursor() {
+  const field = $("#moonvest-cursor-input");
+  const cursor = field.value.trim();
+  if (!cursor) throw new Error("请输入要恢复的 Moonvest cursor；如需 live tail 请点击清空 cursor");
+  if ($("#settings-form").dataset.dirty === "true") await persistFormSettings(false);
+  await mutate("/api/moonvest/cursor", { cursor });
+  field.dataset.edited = "false";
+  toast("恢复 cursor 已保存，Moonvest 正在回放并重连");
+  await loadDashboard(true);
+}
+
+async function clearMoonvestCursor() {
+  if (!window.confirm("确定清空 Moonvest cursor 并从 live tail 继续吗？")) return;
+  await mutate("/api/moonvest/cursor", { cursor: "" });
+  const field = $("#moonvest-cursor-input");
+  field.value = "";
+  field.dataset.edited = "false";
+  toast("Moonvest cursor 已清空，正在连接 live tail");
   await loadDashboard(true);
 }
 
@@ -486,7 +511,7 @@ function bind() {
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   $$('[data-view-jump]').forEach((button) => button.addEventListener("click", () => showView(button.dataset.viewJump)));
   $("#settings-form").addEventListener("submit", (event) => saveSettings(event).catch((error) => toast(error.message, true)));
-  $("#settings-form").addEventListener("change", (event) => { if (event.isTrusted) markSettingsDirty(); });
+  $("#settings-form").addEventListener("change", (event) => { if (event.isTrusted && !event.target.matches("[data-runtime-field]")) markSettingsDirty(); });
   $$('input[name="broker"]').forEach((input) => input.addEventListener("change", () => {
     renderBrokerConfig(input.value, null);
     state.accounts = [];
@@ -495,6 +520,9 @@ function bind() {
   }));
   $("#save-moonvest-key").addEventListener("click", () => saveMoonvestKey().catch((error) => toast(error.message, true)));
   $("#clear-moonvest-key").addEventListener("click", () => clearMoonvestKey().catch((error) => toast(error.message, true)));
+  $("#moonvest-cursor-input").addEventListener("input", (event) => { if (event.isTrusted) event.target.dataset.edited = "true"; });
+  $("#apply-moonvest-cursor").addEventListener("click", () => applyMoonvestCursor().catch((error) => toast(error.message, true)));
+  $("#clear-moonvest-cursor").addEventListener("click", () => clearMoonvestCursor().catch((error) => toast(error.message, true)));
   $("#save-webull-credentials").addEventListener("click", () => saveBrokerCredentials("webull").catch((error) => toast(error.message, true)));
   $("#save-schwab-credentials").addEventListener("click", () => saveBrokerCredentials("schwab").catch((error) => toast(error.message, true)));
   $("#connect-robinhood").addEventListener("click", () => connectRobinhood().catch((error) => toast(error.message, true)));
