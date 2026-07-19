@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Moonvest</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark"><img src="/logo.png" alt="Moonvest"></div><div><strong>Moonvest</strong><small>COPYTRADER</small></div></div>
+    <nav>
+      <button type="button" class="nav-item active" data-view="dashboard"><span>⌁</span>总览</button>
+      <button type="button" class="nav-item" data-view="portfolio"><span>◎</span>账户与持仓</button>
+      <button type="button" class="nav-item" data-view="signals"><span>↗</span>事件流水</button>
+      <button type="button" class="nav-item" data-view="settings"><span>⚙</span>连接与风控</button>
+      <button type="button" class="nav-item" data-view="events"><span>≡</span>审计日志</button>
+    </nav>
+    <div class="sidebar-foot"><i></i><span>本机运行<br><small>密钥存入登录钥匙串</small></span></div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div><p id="page-eyebrow" class="eyebrow">MOONVEST ACTIVE TRADES</p><h1 id="page-title">跟单总览</h1></div>
+      <div class="top-actions">
+        <div id="connection-chip" class="status-chip pending"><i></i><span>正在检查券商 API</span></div>
+        <button id="pause-button" class="btn ghost">暂停</button>
+        <button id="arm-button" class="btn primary">启用执行</button>
+      </div>
+    </header>
+
+    <section id="view-dashboard" class="view active">
+      <div id="safety-banner" class="safety-banner">
+        <div class="shield">◇</div>
+        <div><strong>默认安全模式</strong><p>当前只记录与评估 Moonvest 事件，不会提交订单。</p></div>
+        <span id="mode-label" class="mode-label">仅观察</span>
+      </div>
+
+      <div class="stat-grid">
+        <article class="stat-card"><span id="stat-broker-label">券商 API</span><strong id="stat-broker">检查中</strong><small id="stat-broker-detail">等待连接</small></article>
+        <article class="stat-card"><span>Moonvest SSE</span><strong id="stat-moonvest">等待配置</strong><small id="stat-moonvest-detail">固定 Active Trades 端点</small></article>
+        <article class="stat-card"><span>交易环境</span><strong id="stat-env">模拟盘</strong><small id="stat-account">尚未选择账户</small></article>
+        <article class="stat-card"><span>今日已提交</span><strong id="stat-notional">0.00</strong><small id="stat-limit">单日限额 5,000</small></article>
+        <article class="stat-card"><span>引擎状态</span><strong id="stat-engine">未启用</strong><small id="stat-source">唯一来源 · Moonvest</small></article>
+      </div>
+
+      <div class="dashboard-grid">
+        <article class="panel table-panel">
+          <div class="panel-head"><div><p class="eyebrow">SOURCE STATE</p><h2>Moonvest 当前持仓状态</h2></div><span id="source-position-count" class="count-badge">0</span></div>
+          <div class="table-wrap"><table><thead><tr><th>用户</th><th>标的</th><th>类型</th><th>方向</th><th>数量</th><th>状态</th><th>事件</th></tr></thead><tbody id="source-positions"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><p class="eyebrow">CONFIRMATION QUEUE</p><h2>待确认</h2></div><span id="pending-count" class="count-badge">0</span></div>
+          <div id="pending-list" class="pending-list empty-state"><p>暂无待确认事件</p><small>切换到“人工确认”后，可执行事件会出现在这里。</small></div>
+        </article>
+      </div>
+
+      <article class="panel table-panel">
+        <div class="panel-head"><div><p class="eyebrow">RECENT FLOW</p><h2>最近事件</h2></div><button class="text-btn" data-view-jump="signals">查看全部 →</button></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>标的</th><th>方向</th><th>原始 / 跟单</th><th>状态</th></tr></thead><tbody id="recent-signals"></tbody></table></div>
+      </article>
+    </section>
+
+    <section id="view-portfolio" class="view">
+      <div class="view-head"><div><p class="eyebrow">ACCOUNT TRUTH</p><h2>资金、持仓与订单</h2><p>数据直接读取当前券商 API。</p></div><button id="refresh-portfolio" class="btn ghost">刷新数据</button></div>
+      <div id="fund-cards" class="stat-grid compact"></div>
+      <article class="panel table-panel">
+        <div class="panel-head"><h2>当前持仓</h2><span id="position-count" class="count-badge">0</span></div>
+        <div class="table-wrap"><table><thead><tr><th>代码</th><th>名称</th><th>数量</th><th>可卖</th><th>成本</th><th>市价</th><th>市值</th><th>未实现盈亏</th></tr></thead><tbody id="positions-body"></tbody></table></div>
+      </article>
+      <article class="panel table-panel">
+        <div class="panel-head"><h2>今日订单</h2><span id="order-count" class="count-badge">0</span></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>代码</th><th>方向</th><th>数量</th><th>价格</th><th>成交</th><th>状态</th><th>订单号</th></tr></thead><tbody id="orders-body"></tbody></table></div>
+      </article>
+    </section>
+
+    <section id="view-signals" class="view">
+      <div class="view-head"><div><p class="eyebrow">EVENT LEDGER</p><h2>Moonvest 事件流水</h2><p>事件 id 同时用于持久去重、游标恢复和下游幂等标识。</p></div><button id="refresh-signals" class="btn ghost">刷新流水</button></div>
+      <article class="panel table-panel">
+        <div class="table-wrap"><table><thead><tr><th>接收时间</th><th>用户 / 事件 id</th><th>动作</th><th>标的</th><th>方向</th><th>数量</th><th>金额</th><th>状态</th><th>说明</th><th>订单号</th></tr></thead><tbody id="all-signals"></tbody></table></div>
+      </article>
+    </section>
+
+    <section id="view-settings" class="view">
+      <form id="settings-form" data-dirty="false">
+        <div class="settings-grid">
+          <article class="panel settings-card full source-card">
+            <div class="panel-head"><div><span class="step">01</span><h2>Moonvest Active Trades</h2></div><span id="moonvest-status-badge" class="connection-badge offline">等待配置</span></div>
+            <p class="section-note">唯一开单信息源固定为 Moonvest SSE。每条连接最多跟随两个明确用户名；断线时使用持久 cursor 自动补齐缺口。</p>
+            <div class="endpoint-box"><span>固定端点</span><code>GET https://stream.moonvest.app/v1/active_trades/subscribe</code></div>
+            <div class="form-grid source-config">
+              <label class="field wide"><span>Follow 用户（最多 2 个，逗号分隔）</span><input name="moonvest_follow" placeholder="alice, bob" autocomplete="off" spellcheck="false"></label>
+              <label class="field"><span>Cursor 重连方式</span><select name="moonvest_cursor_mode"><option value="header">Last-Event-ID 请求头</option><option value="since">since 查询参数</option></select></label>
+              <label class="field"><span>API key（只写入钥匙串）</span><input id="moonvest-api-key" class="secret-input" type="password" autocomplete="off" spellcheck="false" placeholder="留空表示不更改"></label>
+            </div>
+            <div class="credential-actions"><button id="save-moonvest-key" type="button" class="btn primary">保存 API key</button><button id="clear-moonvest-key" type="button" class="btn text-danger">清除 API key</button><span id="moonvest-credential-status">尚未保存</span></div>
+            <div id="moonvest-detail" class="detail-box">等待读取连接状态</div>
+          </article>
+
+          <article class="panel settings-card full broker-card">
+            <div class="panel-head broker-panel-head">
+              <div><span class="step">02</span><h2>券商账户</h2></div>
+              <div class="panel-actions"><button id="reload-accounts" type="button" class="btn ghost">刷新账户</button><span id="broker-capability" class="connection-badge offline">正在检测</span></div>
+            </div>
+            <p class="section-note">推荐使用 moomoo：启动本机 OpenD 后，Moonvest 会按默认地址自动连接并发现账户，无需手动添加券商。</p>
+
+            <label class="broker-featured">
+              <input type="radio" name="broker" value="moomoo">
+              <span><i></i><span><strong>moomoo OpenD</strong><small>本机自动连接 · 支持跟单执行</small></span><em id="opend-auto-state">正在检测</em></span>
+            </label>
+
+            <details id="other-brokers" class="other-brokers">
+              <summary><span>其他券商</span><small>Robinhood 官方 MCP，以及其他只读连接</small></summary>
+              <div class="broker-picker secondary">
+                <label><input type="radio" name="broker" value="robinhood"><span><strong>Robinhood</strong><small>官方 MCP · 可执行</small></span></label>
+                <label><input type="radio" name="broker" value="ibkr"><span><strong>IBKR</strong><small>Client Portal · 只读</small></span></label>
+                <label><input type="radio" name="broker" value="webull"><span><strong>Webull</strong><small>官方 HTTPS · 只读</small></span></label>
+                <label><input type="radio" name="broker" value="schwab"><span><strong>嘉信 Schwab</strong><small>官方 OAuth · 只读</small></span></label>
+              </div>
+            </details>
+
+            <div class="broker-config streamlined" data-broker-config="moomoo">
+              <div class="auto-connect-note"><i></i><div><strong>OpenD 自动连接</strong><small>默认使用 127.0.0.1:11111；大多数用户无需修改。</small></div></div>
+              <details class="advanced-settings"><summary>高级连接设置</summary><div class="form-grid"><label class="field"><span>OpenD 主机</span><input name="opend_host" value="127.0.0.1" readonly></label><label class="field"><span>OpenD 端口</span><input name="opend_port" type="number" min="1" max="65535"></label></div></details>
+            </div>
+            <div class="broker-config" data-broker-config="robinhood">
+              <div class="oauth-connect-card">
+                <div><strong>Robinhood Trading MCP</strong><small>通过 Robinhood 官方页面授权；Moonvest 不接触你的密码或 2FA。</small></div>
+                <div class="oauth-actions"><button id="connect-robinhood" type="button" class="btn primary">连接 Robinhood</button><button id="disconnect-robinhood" type="button" class="btn text-danger">断开</button></div>
+              </div>
+              <div id="robinhood-auth-status" class="detail-box">尚未连接</div>
+            </div>
+            <div class="broker-config" data-broker-config="ibkr"><div class="form-grid"><label class="field"><span>Gateway 主机</span><input name="ibkr_host" value="127.0.0.1" readonly></label><label class="field"><span>Gateway HTTPS 端口</span><input name="ibkr_port" type="number" min="1" max="65535"></label></div></div>
+            <div class="broker-config" data-broker-config="webull">
+              <div class="form-grid"><label class="field"><span>环境</span><select name="webull_environment"><option value="production">生产</option><option value="sandbox">沙盒</option></select></label><label class="field"><span>App Key</span><input name="webull_app_key" autocomplete="off"></label><label class="field"><span>App Secret（钥匙串）</span><input id="webull-app-secret" class="secret-input" type="password" autocomplete="off"></label><label class="field"><span>2FA Access Token</span><input id="webull-access-token" class="secret-input" type="password" autocomplete="off"></label></div>
+              <div class="credential-actions"><button id="save-webull-credentials" type="button" class="btn ghost">保存凭证</button><button type="button" class="btn text-danger clear-broker-credentials" data-broker="webull">清除</button><span id="webull-credential-status">尚未保存</span></div>
+            </div>
+            <div class="broker-config" data-broker-config="schwab">
+              <div class="form-grid"><label class="field"><span>Client ID / App Key</span><input name="schwab_client_id" autocomplete="off"></label><label class="field"><span>OAuth 回调地址</span><input name="schwab_callback_url" autocomplete="off"></label><label class="field"><span>Client Secret（钥匙串）</span><input id="schwab-client-secret" class="secret-input" type="password" autocomplete="off"></label><label class="field"><span>Access Token（钥匙串）</span><input id="schwab-access-token" class="secret-input" type="password" autocomplete="off"></label><label class="field"><span>Refresh Token（钥匙串）</span><input id="schwab-refresh-token" class="secret-input" type="password" autocomplete="off"></label></div>
+              <div class="credential-actions"><button id="save-schwab-credentials" type="button" class="btn ghost">保存凭证</button><button type="button" class="btn text-danger clear-broker-credentials" data-broker="schwab">清除</button><span id="schwab-credential-status">尚未保存</span></div>
+            </div>
+            <div class="form-grid account-row"><label class="field wide"><span>执行账户（自动发现）</span><select id="account-select" name="account_key"><option value="">正在发现账户…</option></select><small id="account-discovery-note">启动 OpenD 后会自动载入；只有一个账户时会自动选中。</small></label><label class="field"><span>基础货币</span><select name="base_currency"><option>USD</option><option>JPY</option><option>HKD</option><option>SGD</option><option>MYR</option><option>CNY</option></select></label><label class="field"><span>美股时段</span><select name="us_session"><option value="RTH">仅常规时段</option><option value="ALL">含盘前盘后</option></select></label></div>
+            <div id="api-transport-note" class="scope-note"><strong>API 调度</strong><span>等待读取当前券商能力。</span></div>
+          </article>
+
+          <article class="panel settings-card full">
+            <div class="panel-head"><div><span class="step">03</span><h2>执行与风控</h2></div></div>
+            <div class="mode-picker">
+              <label><input type="radio" name="mode" value="observe"><span><strong>仅观察</strong><small>记录，不下单</small></span></label>
+              <label><input type="radio" name="mode" value="confirm"><span><strong>人工确认</strong><small>逐条确认</small></span></label>
+              <label><input type="radio" name="mode" value="auto"><span><strong>自动跟单</strong><small>通过风控后提交</small></span></label>
+            </div>
+            <div class="form-grid">
+              <label class="field"><span>统一跟单比例</span><div class="suffix-input"><input name="copy_ratio_pct" type="number" min="1" max="100" step="1"><em>%</em></div></label>
+              <label class="field"><span>最大滑点</span><div class="suffix-input"><input name="max_slippage_pct" type="number" min="0" max="100" step="0.1"><em>%</em></div></label>
+              <label class="field"><span>单笔金额上限</span><input name="max_order_notional" type="number" min="1" step="1"></label>
+              <label class="field"><span>单日金额上限</span><input name="max_daily_notional" type="number" min="1" step="1"></label>
+              <label class="field wide"><span>允许市场（逗号分隔）</span><input name="allowed_markets" placeholder="US"></label>
+              <label class="field wide"><span>仅允许这些代码（空=不限）</span><input name="allowed_symbols" placeholder="US.AAPL, US.NVDA"></label>
+              <label class="check-row wide"><input type="checkbox" name="allow_unmanaged_sells"><span><strong>允许卖出非本 App 管理仓位 / 建立空头</strong><small>默认关闭；关闭时卖单不得超过账户当前可卖数量。</small></span></label>
+              <label class="check-row wide"><input type="checkbox" name="expiry_guard_enabled"><span><strong>启用期权到期风险护栏</strong><small>接近最后交易时点时禁止 OPEN / ADD；平仓仍允许。</small></span></label>
+              <label class="field"><span>到期前禁止开仓窗口</span><div class="suffix-input"><input name="expiry_open_cutoff_minutes" type="number" min="15" max="240" step="5"><em>分钟</em></div></label>
+              <label class="check-row"><input type="checkbox" name="reject_nonconforming_option_ticks"><span><strong>拒绝不合规期权限价</strong><small>不静默改价。</small></span></label>
+              <div class="scope-note wide"><strong>安全边界</strong><span id="expiry-policy-note">自动重连不会自动启用下单；断线、resync、保存设置或下单错误都会关闭执行。</span></div>
+            </div>
+          </article>
+        </div>
+        <div class="save-bar"><div><strong>本地配置</strong><span>保存于 ~/Library/Application Support/Moonvest；API key 不进入该目录</span></div><button id="save-settings" type="submit" class="btn primary">保存设置</button></div>
+      </form>
+    </section>
+
+    <section id="view-events" class="view">
+      <div class="view-head"><div><p class="eyebrow">LOCAL AUDIT TRAIL</p><h2>审计日志</h2><p>连接、游标、去重、风控、执行开关与订单结果均落盘在本机。</p></div><button id="refresh-events" class="btn ghost">刷新日志</button></div>
+      <article class="panel"><div id="event-list" class="event-list"></div></article>
+    </section>
+  </main>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
