@@ -412,7 +412,16 @@ class CopyEngine:
             )
             return row or {}
         except BrokerError as exc:
-            self.disarm()
+            # Broker-declared failures are scoped to this order. Keeping the
+            # execution lock armed lets later, independent signals continue;
+            # the failed order remains durably rejected and visible in audit.
+            self.store.event(
+                "order.rejected",
+                "券商拒绝或未接受该笔订单；后续订单继续运行",
+                level="warning",
+                signal_id=signal_id,
+                details={"reason": str(exc), "execution_continues": True},
+            )
             return self._reject(signal_id, f"券商下单失败：{exc}", decision=decision)
         except Exception as exc:
             self.disarm()

@@ -164,7 +164,7 @@
               <label class="check-row wide"><input type="checkbox" name="expiry_guard_enabled"><span><strong>启用期权到期风险护栏</strong><small>接近最后交易时点时禁止 OPEN / ADD；平仓仍允许。</small></span></label>
               <label class="field"><span>到期前禁止开仓窗口</span><div class="suffix-input"><input name="expiry_open_cutoff_minutes" type="number" min="15" max="240" step="5"><em>分钟</em></div></label>
               <label class="check-row"><input type="checkbox" name="reject_nonconforming_option_ticks"><span><strong>拒绝不合规期权限价</strong><small>不静默改价。</small></span></label>
-              <div class="scope-note wide"><strong>安全边界</strong><span id="expiry-policy-note">自动重连不会自动启用下单；断线、resync、保存设置或下单错误都会关闭执行。</span></div>
+              <div class="scope-note wide"><strong>安全边界</strong><span id="expiry-policy-note">单笔风控或券商拒单只影响该笔，后续订单继续；断线、resync、保存设置或未知下单异常仍会关闭执行。</span></div>
             </div>
           </article>
         </div>

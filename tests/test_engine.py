@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from opend_copytrader.api_policy import ApiPacer, RateLimitError
-from opend_copytrader.broker_adapters import BrokerRouter, webull_signature
+from opend_copytrader.broker_adapters import BrokerError, BrokerRouter, webull_signature
 from opend_copytrader.config import AppSettings, SettingsStore
 from opend_copytrader.engine import CopyEngine
 from opend_copytrader.instruments import (
@@ -121,6 +121,56 @@ class CopyEngineTest(unittest.TestCase):
         result = self.engine.submit(self.signal())
         self.assertEqual(result["signal"]["status"], "REJECTED")
         self.assertIn("单笔限额", result["signal"]["reason"])
+
+    def test_broker_reject_only_rejects_one_order_and_keeps_execution_armed(self):
+        class RejectOnceBroker(FakeBroker):
+            def __init__(self):
+                super().__init__()
+                self.reject_next = True
+
+            def place_order(self, settings, **kwargs):
+                if self.reject_next:
+                    self.reject_next = False
+                    raise BrokerError("订单被券商拒绝")
+                return super().place_order(settings, **kwargs)
+
+        self.broker = RejectOnceBroker()
+        self.engine = CopyEngine(self.settings, self.store, self.broker)
+        self.settings.update({
+            "mode": "auto",
+            "account_id": 123,
+            "trading_env": "SIMULATE",
+            "moonvest_follow": ["alice"],
+            "max_order_notional": 1_000_000,
+        })
+        self.engine.arm()
+
+        rejected = self.engine.submit(self.signal("broker-reject", quantity=1))["signal"]
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertTrue(self.engine.state()["armed"])
+
+        placed = self.engine.submit(self.signal("next-order", quantity=1))["signal"]
+        self.assertEqual(placed["status"], "PLACED")
+        self.assertTrue(self.engine.state()["armed"])
+
+    def test_unexpected_order_exception_still_disarms_execution(self):
+        class CrashingBroker(FakeBroker):
+            def place_order(self, settings, **kwargs):
+                raise RuntimeError("unexpected adapter failure")
+
+        self.broker = CrashingBroker()
+        self.engine = CopyEngine(self.settings, self.store, self.broker)
+        self.settings.update({
+            "mode": "auto",
+            "account_id": 123,
+            "trading_env": "SIMULATE",
+            "moonvest_follow": ["alice"],
+            "max_order_notional": 1_000_000,
+        })
+        self.engine.arm()
+        rejected = self.engine.submit(self.signal("unexpected-failure", quantity=1))["signal"]
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertFalse(self.engine.state()["armed"])
 
     def test_expired_option_open_is_rejected_before_quote(self):
         result = self.engine.submit(self.signal(code="US.SPXW200101C6000000", signal_price=2.95))

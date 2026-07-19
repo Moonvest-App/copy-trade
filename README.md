@@ -42,7 +42,7 @@ Accept: text/event-stream
 ## 安全设计
 
 - 默认配置是 `SIMULATE + observe`，即模拟盘 + 仅观察。
-- 订单执行开关只保存在内存；重启、暂停、保存设置、SSE 断线、resync 或下单错误都会关闭。
+- 订单执行开关只保存在内存；重启、暂停、保存设置、SSE 断线、resync 或未知下单异常都会关闭。券商明确拒绝某一笔订单时只拒绝该笔，后续订单继续运行。
 - 执行开关启用 4 小时后自动过期。
 - 实盘 moomoo 必须由用户在 OpenD GUI 中手动解锁；项目不调用 `unlock_trade`。
 - Robinhood 只通过官方 OAuth 2.1 + PKCE 授权，密码和 2FA 不经过 Moonvest；token 只保存在 macOS 登录钥匙串。
