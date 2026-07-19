@@ -516,7 +516,7 @@ class MoonvestStream:
             "Authorization": f"Bearer {api_key}",
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
-            "User-Agent": "Moonvest/1.1.3",
+            "User-Agent": "Moonvest/1.2.0",
         }
         if cursor:
             if settings.moonvest_cursor_mode == "since":

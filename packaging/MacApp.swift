@@ -2,6 +2,13 @@ import Cocoa
 import Darwin
 import WebKit
 
+private enum MonitorLevel {
+    case starting
+    case healthy
+    case warning
+    case offline
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate {
     private var window: NSWindow!
     private var webView: WKWebView!
@@ -12,6 +19,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var startupStarted = Date()
     private var interfaceLoaded = false
     private var shuttingDown = false
+    private var backendBaseURL: URL?
+    private var statusItem: NSStatusItem!
+    private var monitorTimer: Timer?
+    private var monitorRequestInFlight = false
+    private var sseMenuItem: NSMenuItem!
+    private var brokerMenuItem: NSMenuItem!
+    private var executionMenuItem: NSMenuItem!
+    private var eventMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -20,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             NSApp.applicationIconImage = icon
         }
         configureMenus()
+        configureStatusItem()
         createWindow()
         showLoadingPage()
         startBackend()
@@ -27,10 +43,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         return true
@@ -40,8 +59,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         stopBackend()
     }
 
-    func windowWillClose(_ notification: Notification) {
-        stopBackend()
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if shuttingDown {
+            return true
+        }
+        sender.miniaturize(nil)
+        return false
     }
 
     private func configureMenus() {
@@ -85,6 +108,172 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         windowMenuItem.submenu = windowMenu
         NSApp.windowsMenu = windowMenu
         NSApp.mainMenu = mainMenu
+    }
+
+    private func configureStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            button.image = monitorIcon(level: .starting)
+            button.imagePosition = .imageLeft
+            button.title = " 启动中"
+            button.toolTip = "Moonvest 正在启动"
+        }
+
+        let menu = NSMenu(title: "Moonvest 监控")
+        let header = NSMenuItem(title: "Moonvest 状态监控", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(NSMenuItem.separator())
+
+        sseMenuItem = disabledMenuItem("SSE：正在启动")
+        brokerMenuItem = disabledMenuItem("券商：正在检测")
+        executionMenuItem = disabledMenuItem("订单执行：关闭")
+        eventMenuItem = disabledMenuItem("最近事件：暂无")
+        menu.addItem(sseMenuItem)
+        menu.addItem(brokerMenuItem)
+        menu.addItem(executionMenuItem)
+        menu.addItem(eventMenuItem)
+        menu.addItem(NSMenuItem.separator())
+
+        let behavior = disabledMenuItem("关闭窗口只会最小化，后台继续运行")
+        menu.addItem(behavior)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle: "打开 Moonvest", action: #selector(showMainWindow(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "立即刷新状态", action: #selector(refreshMonitorFromMenu(_:)), keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(withTitle: "退出 Moonvest", action: #selector(quitMoonvest(_:)), keyEquivalent: "")
+
+        for item in menu.items where item.action != nil {
+            item.target = self
+        }
+        statusItem.menu = menu
+    }
+
+    private func disabledMenuItem(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    private func monitorIcon(level: MonitorLevel) -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18))
+        image.lockFocus()
+        let color: NSColor
+        switch level {
+        case .starting: color = .systemGray
+        case .healthy: color = .systemGreen
+        case .warning: color = .systemOrange
+        case .offline: color = .systemRed
+        }
+        color.setStroke()
+        let outer = NSBezierPath(ovalIn: NSRect(x: 2.5, y: 2.5, width: 13, height: 13))
+        outer.lineWidth = 1.8
+        outer.stroke()
+        let inner = NSBezierPath(ovalIn: NSRect(x: 6, y: 6, width: 6, height: 6))
+        inner.lineWidth = 1.8
+        inner.stroke()
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
+    }
+
+    @objc private func showMainWindow(_ sender: Any?) {
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func refreshMonitorFromMenu(_ sender: Any?) {
+        refreshMonitor()
+    }
+
+    @objc private func quitMoonvest(_ sender: Any?) {
+        NSApp.terminate(nil)
+    }
+
+    private func startMonitorPolling() {
+        monitorTimer?.invalidate()
+        refreshMonitor()
+        monitorTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.refreshMonitor()
+        }
+        monitorTimer?.tolerance = 1
+    }
+
+    private func refreshMonitor() {
+        guard !shuttingDown, !monitorRequestInFlight,
+              let url = backendBaseURL?.appendingPathComponent("api/dashboard") else {
+            return
+        }
+        monitorRequestInFlight = true
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.monitorRequestInFlight = false
+                guard error == nil,
+                      let http = response as? HTTPURLResponse,
+                      http.statusCode == 200,
+                      let data,
+                      let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    self.updateMonitorUnavailable(error?.localizedDescription ?? "本机服务无响应")
+                    return
+                }
+                self.updateMonitor(root)
+            }
+        }.resume()
+    }
+
+    private func updateMonitor(_ dashboard: [String: Any]) {
+        let moonvest = dashboard["moonvest"] as? [String: Any] ?? [:]
+        let health = dashboard["health"] as? [String: Any] ?? [:]
+        let engine = dashboard["engine"] as? [String: Any] ?? [:]
+        let sseConnected = moonvest["connected"] as? Bool ?? false
+        let brokerConnected = health["connected"] as? Bool ?? false
+        let armed = engine["armed"] as? Bool ?? false
+        let brokerName = health["broker_label"] as? String ?? "券商"
+        let follow = (moonvest["follow"] as? [String] ?? []).joined(separator: ", ")
+        let lastError = moonvest["last_error"] as? String ?? ""
+        let lastEvent = formattedMonitorTime(moonvest["last_event_at"] as? String)
+
+        let level: MonitorLevel = sseConnected && brokerConnected ? .healthy :
+            (sseConnected || brokerConnected ? .warning : .offline)
+        let title = level == .healthy ? (armed ? " 执行中" : " 监控中") : " 需检查"
+        statusItem.button?.image = monitorIcon(level: level)
+        statusItem.button?.title = title
+        statusItem.button?.toolTip = "Moonvest：SSE \(sseConnected ? "在线" : "离线") · \(brokerName) \(brokerConnected ? "在线" : "离线") · 执行\(armed ? "开启" : "关闭")"
+
+        sseMenuItem.title = sseConnected
+            ? "SSE：在线\(follow.isEmpty ? "" : " · \(follow)")"
+            : "SSE：离线\(lastError.isEmpty ? "" : " · \(lastError.prefix(72))")"
+        brokerMenuItem.title = "券商：\(brokerName) · \(brokerConnected ? "在线" : "离线")"
+        executionMenuItem.title = "订单执行：\(armed ? "已启用" : "已关闭")"
+        eventMenuItem.title = "最近事件：\(lastEvent)"
+    }
+
+    private func updateMonitorUnavailable(_ reason: String) {
+        statusItem.button?.image = monitorIcon(level: .offline)
+        statusItem.button?.title = " 需检查"
+        statusItem.button?.toolTip = "Moonvest 本机服务不可用：\(reason)"
+        sseMenuItem.title = "SSE：本机服务不可用"
+        brokerMenuItem.title = "券商：无法读取状态"
+        executionMenuItem.title = "订单执行：状态未知"
+        eventMenuItem.title = "错误：\(reason.prefix(80))"
+    }
+
+    private func formattedMonitorTime(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "暂无" }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = iso.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        guard let date else { return String(value.prefix(19)) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        return formatter.string(from: date)
     }
 
     private func createWindow() {
@@ -169,9 +358,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         process.standardError = stderr
         process.terminationHandler = { [weak self] finished in
             DispatchQueue.main.async {
-                guard let self, !self.shuttingDown, !self.interfaceLoaded else { return }
+                guard let self, !self.shuttingDown else { return }
                 let data = self.errorPipe?.fileHandleForReading.availableData ?? Data()
                 let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.updateMonitorUnavailable(message?.isEmpty == false ? message! : "内置服务意外退出")
                 self.showFailure(message?.isEmpty == false ? message! : "内置服务意外退出（状态码 \(finished.terminationStatus)）。")
             }
         }
@@ -198,7 +388,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
            let url = URL(string: "http://127.0.0.1:\(port)/") {
             timer.invalidate()
             interfaceLoaded = true
+            backendBaseURL = url
             webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
+            startMonitorPolling()
             return
         }
         if Date().timeIntervalSince(startupStarted) > 35 {
@@ -211,6 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         guard !shuttingDown else { return }
         shuttingDown = true
         startupTimer?.invalidate()
+        monitorTimer?.invalidate()
         if let process = backend, process.isRunning {
             process.terminate()
             let deadline = Date().addingTimeInterval(2)
