@@ -19,6 +19,7 @@ from opend_copytrader.instruments import (
     valid_option_limit_tick,
 )
 from opend_copytrader.models import OrderResult, Quote
+from opend_copytrader.moomoo_adapter import OpenDError
 from opend_copytrader.moonvest import (
     CURSOR_META_KEY,
     MoonvestCredentials,
@@ -489,6 +490,25 @@ class CredentialTest(unittest.TestCase):
 
 
 class BrokerAdapterTest(unittest.TestCase):
+    def test_moomoo_order_rejection_is_normalized_as_broker_error(self):
+        class RejectingOpenD:
+            def place_order(self, settings, **kwargs):
+                raise OpenDError("模拟交易暂不支持夜盘时段")
+
+        router = BrokerRouter()
+        router.moomoo = RejectingOpenD()
+        settings = AppSettings(broker="moomoo", account_id=123, moonvest_follow=["alice"])
+        with self.assertRaisesRegex(BrokerError, "模拟交易暂不支持夜盘时段"):
+            router.place_order(
+                settings,
+                code="US.MU",
+                side="BUY",
+                quantity=10,
+                price=848.95,
+                order_type="NORMAL",
+                remark="mv-test",
+            )
+
     def test_webull_signature_matches_official_vector(self):
         signature = webull_signature(
             path="/trade/place_order",

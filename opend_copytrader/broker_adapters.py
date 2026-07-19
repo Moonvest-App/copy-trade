@@ -21,7 +21,7 @@ from .config import AppSettings
 from .api_policy import ApiPacer, EndpointRule, RateLimitError
 from .instruments import broker_expiry_policy, broker_symbol
 from .models import Quote
-from .moomoo_adapter import MoomooAdapter
+from .moomoo_adapter import MoomooAdapter, OpenDError
 from .robinhood_mcp import RobinhoodMCPAdapter
 
 
@@ -969,4 +969,13 @@ class BrokerRouter:
         return self._adapter(settings).sellable_quantity(settings, resolved)
 
     def place_order(self, settings: AppSettings, **kwargs: Any) -> Any:
-        return self._adapter(settings).place_order(settings, **kwargs)
+        try:
+            return self._adapter(settings).place_order(settings, **kwargs)
+        except BrokerError:
+            raise
+        except OpenDError as exc:
+            # OpenD uses its own adapter exception for expected order-level
+            # rejections (unsupported session, locked trading, invalid order,
+            # etc.). Normalize it so one rejected order does not trip the
+            # engine's unknown-failure circuit breaker.
+            raise BrokerError(str(exc)) from exc
