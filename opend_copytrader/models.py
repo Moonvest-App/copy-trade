@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -88,6 +89,28 @@ class CopySignal:
             note=note,
             raw=dict(payload),
         )
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "CopySignal":
+        """从 signals 表行重建信号：raw_json 提供上下文，列值为准。"""
+        try:
+            raw = json.loads(row.get("raw_json") or "{}")
+        except (TypeError, ValueError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        raw.update(
+            external_id=row["external_id"],
+            actor=row["leader"],
+            code=row["code"],
+            side=row["side"],
+            quantity=row["quantity"],
+            action=row.get("action") or "OPEN",
+            signal_price=row["signal_price"],
+            order_type=row["order_type"],
+            note=row["note"],
+        )
+        return cls.from_payload(raw, source="moonvest")
 
     @property
     def market(self) -> str:

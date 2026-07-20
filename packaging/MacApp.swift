@@ -14,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var webView: WKWebView!
     private var backend: Process?
     private var errorPipe: Pipe?
+    private var stderrTail = Data()
+    private let stderrTailLimit = 16_384
+    private let stderrQueue = DispatchQueue(label: "app.moonvest.stderr-tail")
     private var readyFile: URL?
     private var startupTimer: Timer?
     private var startupStarted = Date()
@@ -356,10 +359,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         process.arguments = ["--no-browser", "--port", "8899", "--ready-file", ready.path]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = stderr
+        // 必须持续排空 stderr：管道缓冲约 64KB，写满后后端会在写 stderr 时
+        // 永久阻塞，表现为整个服务假死。只保留末尾片段用于错误展示。
+        stderrQueue.sync { stderrTail.removeAll() }
+        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard let self, !chunk.isEmpty else { return }
+            self.stderrQueue.async {
+                self.stderrTail.append(chunk)
+                if self.stderrTail.count > self.stderrTailLimit {
+                    self.stderrTail.removeFirst(self.stderrTail.count - self.stderrTailLimit)
+                }
+            }
+        }
         process.terminationHandler = { [weak self] finished in
             DispatchQueue.main.async {
-                guard let self, !self.shuttingDown else { return }
-                let data = self.errorPipe?.fileHandleForReading.availableData ?? Data()
+                guard let self else { return }
+                self.errorPipe?.fileHandleForReading.readabilityHandler = nil
+                guard !self.shuttingDown else { return }
+                let data = self.stderrQueue.sync { self.stderrTail }
                 let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.updateMonitorUnavailable(message?.isEmpty == false ? message! : "内置服务意外退出")
                 self.showFailure(message?.isEmpty == false ? message! : "内置服务意外退出（状态码 \(finished.terminationStatus)）。")
@@ -404,6 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         shuttingDown = true
         startupTimer?.invalidate()
         monitorTimer?.invalidate()
+        errorPipe?.fileHandleForReading.readabilityHandler = nil
         if let process = backend, process.isRunning {
             process.terminate()
             let deadline = Date().addingTimeInterval(2)

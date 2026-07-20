@@ -85,11 +85,21 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class RequestHandler(BaseHTTPRequestHandler):
+    """本机 API：GET 路由表 + POST 路由表 + 静态文件回退。
+
+    写操作（POST/PUT）额外要求 X-Local-App 请求头，阻止浏览器里其他页面
+    发起的跨站表单/fetch 触发本机副作用。
+    """
+
     server: LocalServer
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
+
+    @property
+    def app(self) -> Application:
+        return self.server.app
 
     def do_GET(self) -> None:  # noqa: N802
         if not self._local_host():
@@ -98,65 +108,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         try:
-            if path == "/api/robinhood/oauth/callback":
-                code = str(query.get("code", [""])[0])
-                state = str(query.get("state", [""])[0])
-                error = str(query.get("error_description", query.get("error", [""]))[0])
-                if error:
-                    raise ValueError(f"Robinhood 拒绝授权：{error}")
-                if not code or not state:
-                    raise ValueError("Robinhood OAuth 回调缺少 code 或 state")
-                self.server.app.adapter.complete_robinhood_oauth(code, state)
-                self.server.app.engine.disarm()
-                self.server.app.store.event(
-                    "robinhood.oauth_connected", "Robinhood Trading MCP OAuth 已连接"
-                )
-                return self._redirect("/api/robinhood/oauth/complete")
-            if path == "/api/robinhood/oauth/complete":
-                return self._html(
-                    "<!doctype html><meta charset='utf-8'><title>Moonvest</title>"
-                    "<style>body{margin:0;display:grid;place-items:center;height:100vh;background:#070e1c;color:#edf3fb;font:16px -apple-system}div{text-align:center}p{color:#8291a7}</style>"
-                    "<div><h1>Robinhood 已连接</h1><p>可以关闭此窗口并返回 Moonvest。</p></div>"
-                )
-            if path == "/api/dashboard":
-                return self._json(self.server.app.dashboard())
-            if path == "/api/health":
-                return self._json(self.server.app.adapter.health(self.server.app.settings.get()))
-            if path == "/api/settings":
-                return self._json(self.server.app.settings.get().public_dict())
-            if path == "/api/engine":
-                return self._json(self.server.app.engine.state())
-            if path == "/api/moonvest/status":
-                return self._json(self.server.app.moonvest_stream.status())
-            if path == "/api/moonvest/positions":
-                return self._json({"positions": self.server.app.store.list_moonvest_positions(300)})
-            if path == "/api/robinhood/status":
-                return self._json(self.server.app.adapter.robinhood.health(self.server.app.settings.get()))
-            if path == "/api/accounts":
-                return self._json(
-                    {"accounts": self.server.app.adapter.accounts(self.server.app.settings.get())}
-                )
-            if path == "/api/broker/credentials":
-                broker = str(
-                    query.get("broker", [self.server.app.settings.get().broker])[0]
-                ).strip().lower()
-                return self._json(
-                    {"broker": broker, "status": self.server.app.adapter.credential_status(broker)}
-                )
-            if path == "/api/portfolio":
-                return self._json(self.server.app.adapter.portfolio(self.server.app.settings.get()))
-            if path == "/api/orders":
-                orders = self.server.app.adapter.orders(self.server.app.settings.get())
-                self.server.app.store.reconcile_orders(orders)
-                return self._json({"orders": orders})
-            if path == "/api/signals":
-                status = query.get("status", [None])[0]
-                limit = int(query.get("limit", ["100"])[0])
-                return self._json({"signals": self.server.app.store.list_signals(limit, status)})
-            if path == "/api/events":
-                limit = int(query.get("limit", ["100"])[0])
-                return self._json({"events": self.server.app.store.list_events(limit)})
-            return self._static(path)
+            handler = self.GET_ROUTES.get(path)
+            if handler is None:
+                return self._static(path)
+            return handler(self, query)
         except ValueError as exc:
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
@@ -170,72 +125,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         try:
             payload = self._body()
-            if path == "/api/moonvest/credentials":
-                if bool(payload.get("clear")):
-                    result = self.server.app.moonvest_credentials.clear()
-                    self.server.app.engine.disarm()
-                    self.server.app.store.event(
-                        "moonvest.credentials_cleared", "已从 macOS 钥匙串清除 Moonvest API key"
-                    )
-                else:
-                    result = self.server.app.moonvest_credentials.save(
-                        str(payload.get("api_key") or "")
-                    )
-                    self.server.app.store.event(
-                        "moonvest.credentials_saved", "已将 Moonvest API key 保存到 macOS 钥匙串"
-                    )
-                self.server.app.moonvest_stream.wake()
-                return self._json(result)
-            if path == "/api/moonvest/cursor":
-                return self._json(
-                    self.server.app.moonvest_stream.replace_cursor(payload.get("cursor"))
-                )
-            if path == "/api/robinhood/oauth/start":
-                authorization_url = self.server.app.adapter.robinhood_authorization_url()
-                opened = webbrowser.open(authorization_url)
-                return self._json({"started": bool(opened)})
-            if path == "/api/robinhood/oauth/disconnect":
-                self.server.app.adapter.disconnect_robinhood()
-                self.server.app.engine.disarm()
-                self.server.app.store.event(
-                    "robinhood.oauth_disconnected", "Robinhood Trading MCP OAuth 已断开"
-                )
-                return self._json({"connected": False})
+            handler = self.POST_ROUTES.get(path)
+            if handler is not None:
+                return handler(self, payload)
             if path.startswith("/api/signals/") and path.endswith("/approve"):
                 signal_id = path.split("/")[3]
-                return self._json({"signal": self.server.app.engine.approve(signal_id)})
+                return self._json({"signal": self.app.engine.approve(signal_id)})
             if path.startswith("/api/signals/") and path.endswith("/reject"):
                 signal_id = path.split("/")[3]
                 reason = str(payload.get("reason") or "操作员拒绝")
-                return self._json({"signal": self.server.app.engine.reject(signal_id, reason)})
-            if path == "/api/engine/arm":
-                if not self.server.app.moonvest_credentials.api_key():
-                    raise ValueError("请先配置 Moonvest API key")
-                return self._json(
-                    self.server.app.engine.arm(
-                        manual_unlock_confirmed=bool(payload.get("manual_unlock_confirmed"))
-                    )
-                )
-            if path == "/api/engine/disarm":
-                return self._json(self.server.app.engine.disarm())
-            if path == "/api/engine/pause":
-                return self._json(self.server.app.engine.pause(bool(payload.get("paused", True))))
-            if path == "/api/broker/credentials":
-                broker = str(
-                    payload.get("broker") or self.server.app.settings.get().broker
-                ).strip().lower()
-                if bool(payload.get("clear")):
-                    status = self.server.app.adapter.clear_credentials(broker)
-                    self.server.app.engine.disarm()
-                    self.server.app.store.event(
-                        "broker.credentials_cleared", f"已从 macOS 钥匙串清除 {broker} API 凭证"
-                    )
-                else:
-                    status = self.server.app.adapter.save_credentials(broker, payload)
-                    self.server.app.store.event(
-                        "broker.credentials_saved", f"已将 {broker} API 凭证保存到 macOS 钥匙串"
-                    )
-                return self._json({"broker": broker, "status": status})
+                return self._json({"signal": self.app.engine.reject(signal_id, reason)})
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -251,16 +150,173 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             if path != "/api/settings":
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-            settings = self.server.app.settings.update(self._body())
-            self.server.app.engine.disarm()
-            self.server.app.adapter.invalidate()
-            self.server.app.moonvest_stream.wake()
-            self.server.app.store.event("settings.updated", "设置已保存，订单执行已自动关闭")
+            settings = self.app.settings.update(self._body())
+            self.app.engine.disarm()
+            self.app.adapter.invalidate()
+            self.app.moonvest_stream.wake()
+            self.app.store.event("settings.updated", "设置已保存，订单执行已自动关闭")
             return self._json(settings.public_dict())
         except ValueError as exc:
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             return self._json({"error": str(exc)}, HTTPStatus.SERVICE_UNAVAILABLE)
+
+    # ---- GET 端点 ----
+
+    def _get_oauth_callback(self, query: dict[str, list[str]]) -> None:
+        code = str(query.get("code", [""])[0])
+        state = str(query.get("state", [""])[0])
+        error = str(query.get("error_description", query.get("error", [""]))[0])
+        if error:
+            raise ValueError(f"Robinhood 拒绝授权：{error}")
+        if not code or not state:
+            raise ValueError("Robinhood OAuth 回调缺少 code 或 state")
+        self.app.adapter.complete_robinhood_oauth(code, state)
+        self.app.engine.disarm()
+        self.app.store.event("robinhood.oauth_connected", "Robinhood Trading MCP OAuth 已连接")
+        return self._redirect("/api/robinhood/oauth/complete")
+
+    def _get_oauth_complete(self, query: dict[str, list[str]]) -> None:
+        return self._html(
+            "<!doctype html><meta charset='utf-8'><title>Moonvest</title>"
+            "<style>body{margin:0;display:grid;place-items:center;height:100vh;background:#070e1c;color:#edf3fb;font:16px -apple-system}div{text-align:center}p{color:#8291a7}</style>"
+            "<div><h1>Robinhood 已连接</h1><p>可以关闭此窗口并返回 Moonvest。</p></div>"
+        )
+
+    def _get_dashboard(self, query: dict[str, list[str]]) -> None:
+        return self._json(self.app.dashboard())
+
+    def _get_health(self, query: dict[str, list[str]]) -> None:
+        return self._json(self.app.adapter.health(self.app.settings.get()))
+
+    def _get_settings(self, query: dict[str, list[str]]) -> None:
+        return self._json(self.app.settings.get().public_dict())
+
+    def _get_engine(self, query: dict[str, list[str]]) -> None:
+        return self._json(self.app.engine.state())
+
+    def _get_moonvest_status(self, query: dict[str, list[str]]) -> None:
+        return self._json(self.app.moonvest_stream.status())
+
+    def _get_moonvest_positions(self, query: dict[str, list[str]]) -> None:
+        return self._json({"positions": self.app.store.list_moonvest_positions(300)})
+
+    def _get_robinhood_status(self, query: dict[str, list[str]]) -> None:
+        return self._json(self.app.adapter.robinhood.health(self.app.settings.get()))
+
+    def _get_accounts(self, query: dict[str, list[str]]) -> None:
+        return self._json({"accounts": self.app.adapter.accounts(self.app.settings.get())})
+
+    def _get_broker_credentials(self, query: dict[str, list[str]]) -> None:
+        broker = str(query.get("broker", [self.app.settings.get().broker])[0]).strip().lower()
+        return self._json({"broker": broker, "status": self.app.adapter.credential_status(broker)})
+
+    def _get_portfolio(self, query: dict[str, list[str]]) -> None:
+        return self._json(self.app.adapter.portfolio(self.app.settings.get()))
+
+    def _get_orders(self, query: dict[str, list[str]]) -> None:
+        orders = self.app.adapter.orders(self.app.settings.get())
+        self.app.store.reconcile_orders(orders)
+        return self._json({"orders": orders})
+
+    def _get_signals(self, query: dict[str, list[str]]) -> None:
+        status = query.get("status", [None])[0]
+        limit = int(query.get("limit", ["100"])[0])
+        return self._json({"signals": self.app.store.list_signals(limit, status)})
+
+    def _get_events(self, query: dict[str, list[str]]) -> None:
+        limit = int(query.get("limit", ["100"])[0])
+        return self._json({"events": self.app.store.list_events(limit)})
+
+    # ---- POST 端点 ----
+
+    def _post_moonvest_credentials(self, payload: dict[str, Any]) -> None:
+        if bool(payload.get("clear")):
+            result = self.app.moonvest_credentials.clear()
+            self.app.engine.disarm()
+            self.app.store.event(
+                "moonvest.credentials_cleared", "已从 macOS 钥匙串清除 Moonvest API key"
+            )
+        else:
+            result = self.app.moonvest_credentials.save(str(payload.get("api_key") or ""))
+            self.app.store.event(
+                "moonvest.credentials_saved", "已将 Moonvest API key 保存到 macOS 钥匙串"
+            )
+        self.app.moonvest_stream.wake()
+        return self._json(result)
+
+    def _post_moonvest_cursor(self, payload: dict[str, Any]) -> None:
+        return self._json(self.app.moonvest_stream.replace_cursor(payload.get("cursor")))
+
+    def _post_oauth_start(self, payload: dict[str, Any]) -> None:
+        authorization_url = self.app.adapter.robinhood_authorization_url()
+        opened = webbrowser.open(authorization_url)
+        return self._json({"started": bool(opened)})
+
+    def _post_oauth_disconnect(self, payload: dict[str, Any]) -> None:
+        self.app.adapter.disconnect_robinhood()
+        self.app.engine.disarm()
+        self.app.store.event("robinhood.oauth_disconnected", "Robinhood Trading MCP OAuth 已断开")
+        return self._json({"connected": False})
+
+    def _post_engine_arm(self, payload: dict[str, Any]) -> None:
+        if not self.app.moonvest_credentials.api_key():
+            raise ValueError("请先配置 Moonvest API key")
+        return self._json(
+            self.app.engine.arm(
+                manual_unlock_confirmed=bool(payload.get("manual_unlock_confirmed"))
+            )
+        )
+
+    def _post_engine_disarm(self, payload: dict[str, Any]) -> None:
+        return self._json(self.app.engine.disarm())
+
+    def _post_engine_pause(self, payload: dict[str, Any]) -> None:
+        return self._json(self.app.engine.pause(bool(payload.get("paused", True))))
+
+    def _post_broker_credentials(self, payload: dict[str, Any]) -> None:
+        broker = str(payload.get("broker") or self.app.settings.get().broker).strip().lower()
+        if bool(payload.get("clear")):
+            status = self.app.adapter.clear_credentials(broker)
+            self.app.engine.disarm()
+            self.app.store.event(
+                "broker.credentials_cleared", f"已从 macOS 钥匙串清除 {broker} API 凭证"
+            )
+        else:
+            status = self.app.adapter.save_credentials(broker, payload)
+            self.app.store.event(
+                "broker.credentials_saved", f"已将 {broker} API 凭证保存到 macOS 钥匙串"
+            )
+        return self._json({"broker": broker, "status": status})
+
+    GET_ROUTES = {
+        "/api/robinhood/oauth/callback": _get_oauth_callback,
+        "/api/robinhood/oauth/complete": _get_oauth_complete,
+        "/api/dashboard": _get_dashboard,
+        "/api/health": _get_health,
+        "/api/settings": _get_settings,
+        "/api/engine": _get_engine,
+        "/api/moonvest/status": _get_moonvest_status,
+        "/api/moonvest/positions": _get_moonvest_positions,
+        "/api/robinhood/status": _get_robinhood_status,
+        "/api/accounts": _get_accounts,
+        "/api/broker/credentials": _get_broker_credentials,
+        "/api/portfolio": _get_portfolio,
+        "/api/orders": _get_orders,
+        "/api/signals": _get_signals,
+        "/api/events": _get_events,
+    }
+
+    POST_ROUTES = {
+        "/api/moonvest/credentials": _post_moonvest_credentials,
+        "/api/moonvest/cursor": _post_moonvest_cursor,
+        "/api/robinhood/oauth/start": _post_oauth_start,
+        "/api/robinhood/oauth/disconnect": _post_oauth_disconnect,
+        "/api/engine/arm": _post_engine_arm,
+        "/api/engine/disarm": _post_engine_disarm,
+        "/api/engine/pause": _post_engine_pause,
+        "/api/broker/credentials": _post_broker_credentials,
+    }
 
     def _body(self) -> dict[str, Any]:
         size = int(self.headers.get("Content-Length", "0") or 0)
@@ -316,6 +372,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if status >= HTTPStatus.BAD_REQUEST:
+            # 错误路径可能没有读完请求体（如 403 提前返回）。残留字节会
+            # 污染 keep-alive 连接，使下一个请求被解析成非法方法（501）。
+            # 关闭连接丢弃未读数据，客户端会自动重建连接。
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(data)
 

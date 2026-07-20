@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import unittest
+import unittest.mock
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -471,6 +473,14 @@ class MoonvestStreamTest(unittest.TestCase):
 
 
 class CredentialTest(unittest.TestCase):
+    def setUp(self):
+        # 宿主 shell 可能导出了真实的 MOONVEST_API_KEY；测试必须与之隔离，
+        # 否则环境覆盖优先级会掩盖钥匙串行为，还会把真实 key 打进断言输出。
+        patcher = unittest.mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("MOONVEST_API_KEY", None)
+
     def test_api_key_uses_keychain_without_entering_settings(self):
         class MemoryKeychain:
             def __init__(self): self.values = {}

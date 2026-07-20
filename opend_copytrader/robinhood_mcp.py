@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from . import __version__ as APP_VERSION
 from .models import OrderResult, Quote
 
 
@@ -365,7 +366,7 @@ class RobinhoodMCPAdapter:
             "params": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "Moonvest", "version": "1.1.0"},
+                "clientInfo": {"name": "Moonvest", "version": APP_VERSION},
             },
         })
         if result.get("id") != request_id or not isinstance(result.get("result"), dict):

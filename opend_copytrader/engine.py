@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
@@ -325,22 +324,7 @@ class CopyEngine:
             raise ValueError(f"当前状态 {row['status']} 不能确认")
         if not self.state()["armed"]:
             raise ValueError("请先启用订单执行")
-        try:
-            raw = json.loads(row.get("raw_json") or "{}")
-        except (TypeError, ValueError):
-            raw = {}
-        raw.update(
-            external_id=row["external_id"],
-            actor=row["leader"],
-            code=row["code"],
-            side=row["side"],
-            quantity=row["quantity"],
-            action=row.get("action") or "OPEN",
-            signal_price=row["signal_price"],
-            order_type=row["order_type"],
-            note=row["note"],
-        )
-        signal = CopySignal.from_payload(raw, source="moonvest")
+        signal = CopySignal.from_row(row)
         settings = self.settings_store.get()
         try:
             decision, no_attempt = self._prepare_decision(settings, signal)

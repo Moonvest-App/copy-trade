@@ -63,7 +63,7 @@
     </section>
 
     <section id="view-portfolio" class="view">
-      <div class="view-head"><div><p class="eyebrow">ACCOUNT TRUTH</p><h2>资金、持仓与订单</h2><p>数据直接读取当前券商 API。</p></div><button id="refresh-portfolio" class="btn ghost">刷新数据</button></div>
+      <div class="view-head"><div><h2>资金、持仓与订单</h2><p>数据直接读取当前券商 API。</p></div><button id="refresh-portfolio" class="btn ghost">刷新数据</button></div>
       <div id="fund-cards" class="stat-grid compact"></div>
       <article class="panel table-panel">
         <div class="panel-head"><h2>当前持仓</h2><span id="position-count" class="count-badge">0</span></div>
@@ -76,7 +76,7 @@
     </section>
 
     <section id="view-signals" class="view">
-      <div class="view-head"><div><p class="eyebrow">EVENT LEDGER</p><h2>Moonvest 事件流水</h2><p>事件 id 同时用于持久去重、游标恢复和下游幂等标识。</p></div><button id="refresh-signals" class="btn ghost">刷新流水</button></div>
+      <div class="view-head"><div><h2>Moonvest 事件流水</h2><p>事件 id 同时用于持久去重、游标恢复和下游幂等标识。</p></div><button id="refresh-signals" class="btn ghost">刷新流水</button></div>
       <article class="panel table-panel">
         <div class="table-wrap"><table><thead><tr><th>接收时间</th><th>用户 / 事件 id</th><th>动作</th><th>标的</th><th>方向</th><th>数量</th><th>金额</th><th>状态</th><th>说明</th><th>订单号</th></tr></thead><tbody id="all-signals"></tbody></table></div>
       </article>
@@ -173,7 +173,7 @@
     </section>
 
     <section id="view-events" class="view">
-      <div class="view-head"><div><p class="eyebrow">LOCAL AUDIT TRAIL</p><h2>审计日志</h2><p>连接、游标、去重、风控、执行开关与订单结果均落盘在本机。</p></div><button id="refresh-events" class="btn ghost">刷新日志</button></div>
+      <div class="view-head"><div><h2>审计日志</h2><p>连接、游标、去重、风控、执行开关与订单结果均落盘在本机。</p></div><button id="refresh-events" class="btn ghost">刷新日志</button></div>
       <article class="panel"><div id="event-list" class="event-list"></div></article>
     </section>
   </main>

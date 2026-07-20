@@ -14,6 +14,7 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Callable, Iterable, Iterator
 
+from . import __version__ as APP_VERSION
 from .broker_adapters import KeychainStore
 from .config import SettingsStore
 from .engine import CopyEngine
@@ -516,7 +517,7 @@ class MoonvestStream:
             "Authorization": f"Bearer {api_key}",
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache",
-            "User-Agent": "Moonvest/1.2.0",
+            "User-Agent": f"Moonvest/{APP_VERSION}",
         }
         if cursor:
             if settings.moonvest_cursor_mode == "since":
