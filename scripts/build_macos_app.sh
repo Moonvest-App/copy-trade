@@ -29,8 +29,8 @@ if [ "$ARCH" != "arm64" ]; then
   exit 1
 fi
 
-"$BUILD_VENV/bin/python" -c 'import pandas, moomoo' || {
-  echo "Build Python cannot import pandas/moomoo; install requirements first." >&2
+"$BUILD_VENV/bin/python" -c 'import certifi, pandas, moomoo' || {
+  echo "Build Python cannot import certifi/pandas/moomoo; install requirements first." >&2
   exit 1
 }
 
@@ -50,6 +50,7 @@ arch -arm64 "$BUILD_VENV/bin/python" -m PyInstaller \
   --onedir \
   --name "$BACKEND_NAME" \
   --target-arch arm64 \
+  --collect-data certifi \
   --collect-data moomoo \
   --collect-submodules moomoo.common.pb \
   --exclude-module pandas.tests \

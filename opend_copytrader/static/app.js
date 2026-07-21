@@ -1,5 +1,5 @@
 const LOCAL_HEADERS = { "Content-Type": "application/json", "X-Local-App": "moonvest" };
-const state = { dashboard: null, accounts: [], activeView: "dashboard", timer: null, robinhoodConnected: undefined };
+const state = { dashboard: null, accounts: [], accountRequest: 0, activeView: "dashboard", timer: null, robinhoodConnected: undefined };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
@@ -308,9 +308,6 @@ async function clearBrokerCredentials(broker) {
 async function connectRobinhood() {
   const selected = document.querySelector('input[name="broker"]:checked')?.value;
   if (selected !== "robinhood") throw new Error("请先选择 Robinhood");
-  if (state.dashboard?.settings.broker !== "robinhood" || $("#settings-form").dataset.dirty === "true") {
-    await persistFormSettings(false);
-  }
   await mutate("/api/robinhood/oauth/start");
   toast("已打开 Robinhood 官方授权页面；完成后返回 Moonvest 即可");
 }
@@ -324,18 +321,27 @@ async function disconnectRobinhood() {
 }
 
 async function loadAccounts(quiet = false) {
-  const broker = state.dashboard?.settings.broker || "moomoo";
+  const broker = document.querySelector('input[name="broker"]:checked')?.value || state.dashboard?.settings.broker || "moomoo";
+  const requestId = ++state.accountRequest;
   const select = $("#account-select");
   const note = $("#account-discovery-note");
+  const previousSelection = select.value;
+  const formWasDirty = $("#settings-form").dataset.dirty === "true";
   if (note) note.textContent = `正在从 ${BROKER_LABELS[broker] || broker} 自动发现账户…`;
   if (!quiet) toast(`正在从 ${BROKER_LABELS[broker] || broker} 发现账户…`);
-  const data = await api("/api/accounts");
+  const data = await api(`/api/accounts?broker=${encodeURIComponent(broker)}`);
+  const visibleBroker = document.querySelector('input[name="broker"]:checked')?.value || state.dashboard?.settings.broker || "moomoo";
+  if (requestId !== state.accountRequest || visibleBroker !== broker) return;
   state.accounts = data.accounts || [];
   const selectable = state.accounts.filter((account) => account.selectable);
   select.innerHTML = [`<option value="">请选择账户</option>`, ...selectable.map((account) => `<option value="${esc(accountKey(account))}">${esc(account.display_name)}</option>`)].join("");
-  if (state.dashboard) fillSettings({ ...state.dashboard.settings });
-  const formWasDirty = $("#settings-form").dataset.dirty === "true";
-  const savedAccount = selectedBrokerAccount(state.dashboard?.settings || {});
+  const savedSettings = state.dashboard?.settings || {};
+  const savedAccount = savedSettings.broker === broker ? selectedBrokerAccount(savedSettings) : "";
+  if (previousSelection && [...select.options].some((option) => option.value === previousSelection)) {
+    select.value = previousSelection;
+  } else if (savedAccount) {
+    setAccountSelection(select, broker, broker === "moomoo" ? savedSettings.security_firm : broker.toUpperCase(), savedAccount, savedSettings.trading_env);
+  }
   if (!select.value && selectable.length === 1) {
     select.value = accountKey(selectable[0]);
     if (!formWasDirty && !savedAccount) {
@@ -428,11 +434,17 @@ async function persistFormSettings(discoverAccounts = true) {
   if (discoverAccounts) await loadAccounts(true);
 }
 
-async function saveSettings(event) {
-  event.preventDefault();
-  if (event.submitter?.id !== "save-settings") return;
-  await persistFormSettings(true);
-  toast("设置已保存，SSE 将按新配置重连，订单执行已关闭");
+async function saveSettings() {
+  const button = $("#save-settings");
+  button.disabled = true;
+  button.textContent = "正在保存…";
+  try {
+    await persistFormSettings(true);
+    toast("设置已保存，SSE 将按新配置重连，订单执行已关闭");
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存设置";
+  }
 }
 
 async function armToggle() {
@@ -510,13 +522,15 @@ function showView(name, message) {
 function bind() {
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   $$('[data-view-jump]').forEach((button) => button.addEventListener("click", () => showView(button.dataset.viewJump)));
-  $("#settings-form").addEventListener("submit", (event) => saveSettings(event).catch((error) => toast(error.message, true)));
+  $("#settings-form").addEventListener("submit", (event) => event.preventDefault());
+  $("#save-settings").addEventListener("click", () => saveSettings().catch((error) => toast(error.message, true)));
   $("#settings-form").addEventListener("change", (event) => { if (event.isTrusted && !event.target.matches("[data-runtime-field]")) markSettingsDirty(); });
   $$('input[name="broker"]').forEach((input) => input.addEventListener("change", () => {
     renderBrokerConfig(input.value, null);
     state.accounts = [];
-    $("#account-select").innerHTML = `<option value="">保存后将自动发现账户</option>`;
-    $("#account-discovery-note").textContent = input.value === "moomoo" ? "保存后会自动连接本机 OpenD 并发现账户。" : "保存券商设置后会自动发现账户。";
+    $("#account-select").innerHTML = `<option value="">正在从 ${esc(BROKER_LABELS[input.value] || input.value)} 发现账户…</option>`;
+    $("#account-discovery-note").textContent = "无需先保存券商，正在读取可用账户。";
+    loadAccounts(true).catch((error) => { $("#account-discovery-note").textContent = error.message; });
   }));
   $("#save-moonvest-key").addEventListener("click", () => saveMoonvestKey().catch((error) => toast(error.message, true)));
   $("#clear-moonvest-key").addEventListener("click", () => clearMoonvestKey().catch((error) => toast(error.message, true)));
@@ -535,6 +549,10 @@ function bind() {
   $("#refresh-portfolio").addEventListener("click", loadPortfolio);
   $("#refresh-signals").addEventListener("click", loadSignals);
   $("#refresh-events").addEventListener("click", loadEvents);
+  window.addEventListener("focus", () => {
+    const broker = document.querySelector('input[name="broker"]:checked')?.value;
+    if (broker === "robinhood") loadAccounts(true).catch(() => {});
+  });
 }
 
 bind();

@@ -11,6 +11,7 @@ import urllib.request
 from typing import Any
 
 from ..api_policy import ApiPacer
+from ..tls import trusted_ssl_context
 
 
 class BrokerError(RuntimeError):
@@ -40,6 +41,8 @@ def json_request(
     if pacer is not None:
         pacer.acquire(route or urllib.parse.urlparse(url).path)
     request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+    if context is None and urllib.parse.urlparse(url).scheme == "https":
+        context = trusted_ssl_context()
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             raw = response.read(4_000_000)

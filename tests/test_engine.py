@@ -8,6 +8,7 @@ import unittest
 import unittest.mock
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from opend_copytrader.api_policy import ApiPacer, RateLimitError
@@ -32,7 +33,9 @@ from opend_copytrader.moonvest import (
     trade_to_signal,
 )
 from opend_copytrader.robinhood_mcp import RobinhoodMCPAdapter, parse_mcp_http_body
+from opend_copytrader.server import Application
 from opend_copytrader.store import LocalStore
+from opend_copytrader.tls import bundled_ca_file, trusted_ssl_context
 
 
 class FakeBroker:
@@ -639,6 +642,47 @@ class InstrumentPolicyTest(unittest.TestCase):
             now=datetime(2026, 7, 17, 15, 30, tzinfo=ZoneInfo("America/New_York")),
         )
         self.assertIn("禁止新开仓", reason)
+
+
+class SharedAppRegressionTest(unittest.TestCase):
+    def test_account_discovery_can_target_an_unsaved_broker(self):
+        saved = AppSettings(broker="moomoo")
+        app = Application.__new__(Application)
+        app.settings = SimpleNamespace(get=lambda: AppSettings(**saved.public_dict()))
+        discovered = []
+        app.adapter = SimpleNamespace(accounts=lambda settings: discovered.append(settings) or [])
+
+        self.assertEqual(app.discover_accounts("robinhood"), [])
+        self.assertEqual(discovered[0].broker, "robinhood")
+        self.assertEqual(saved.broker, "moomoo")
+        with self.assertRaisesRegex(ValueError, "券商只能选择"):
+            app.discover_accounts("unknown-broker")
+
+    def test_settings_ui_uses_explicit_save_click_and_selected_broker_discovery(self):
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "opend_copytrader" / "static" / "app.js").read_text(encoding="utf-8")
+        html = (root / "opend_copytrader" / "static" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('/api/accounts?broker=${encodeURIComponent(broker)}', javascript)
+        self.assertNotIn("event.submitter", javascript)
+        self.assertIn('$("#save-settings").addEventListener("click"', javascript)
+        save_button = next(line for line in html.splitlines() if 'id="save-settings"' in line)
+        self.assertIn('type="button"', save_button)
+
+    def test_share_build_uses_bundled_ca_for_python_https(self):
+        root = Path(__file__).resolve().parents[1]
+        ca_file = bundled_ca_file()
+        self.assertIsNotNone(ca_file)
+        self.assertTrue(Path(ca_file).is_file())
+        context = trusted_ssl_context()
+        self.assertTrue(context.check_hostname)
+        self.assertGreater(context.cert_store_stats()["x509_ca"], 100)
+
+        swift = (root / "packaging" / "MacApp.swift").read_text(encoding="utf-8")
+        build_script = (root / "scripts" / "build_macos_app.sh").read_text(encoding="utf-8")
+        self.assertIn('environment["SSL_CERT_FILE"] = caFile.path', swift)
+        self.assertIn('environment["REQUESTS_CA_BUNDLE"] = caFile.path', swift)
+        self.assertIn("--collect-data certifi", build_script)
 
 
 if __name__ == "__main__":

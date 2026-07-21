@@ -1,11 +1,11 @@
-Moonvest 1.1.0
+Moonvest 1.2.2
 macOS Apple Silicon（M1 / M2 / M3 / M4 系列）分享版
 
 安装步骤
 
 1. 双击 DMG，把“Moonvest”拖到“Applications”文件夹。
 2. 打开 App，在“连接与风控”中填写最多两个 Moonvest follow 用户，并把自己的 API key 保存到 macOS 登录钥匙串。
-3. 使用 moomoo 时只需先启动 OpenD；使用 Robinhood 时点击“连接 Robinhood”，在官方页面完成 OAuth 授权。可用账户会自动发现，只有一个时会自动选中。
+3. 使用 moomoo 时只需先启动 OpenD；切换券商后无需先保存即可发现账户。使用 Robinhood 时点击“连接 Robinhood”，在官方页面完成 OAuth 授权，再返回 App 选择账户并一次性保存。
 4. 新安装默认是模拟盘 + 仅观察，不会提交订单。
 
 macOS 首次打开提示
@@ -21,6 +21,7 @@ macOS 首次打开提示
 安全说明
 
 - Moonvest API key 只保存到接收者自己的 macOS 登录钥匙串，不进入设置文件、数据库、日志或分享包。
+- 分享版使用 App 内置可信 CA 验证 Moonvest 与券商 HTTPS，不依赖接收者安装 Python 证书。
 - App 不接收券商登录密码或交易密码。Robinhood 连接全程使用官方 OAuth 页面；Webull / 嘉信 API 密钥与令牌同样只保存到登录钥匙串。
 - 唯一开单信息源是 Moonvest Active Trades SSE；没有手动单、Webhook 或其他来源入口。
 - 事件 id 用于持久去重、cursor 恢复和下游幂等标识。

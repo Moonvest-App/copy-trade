@@ -4,6 +4,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from opend_copytrader.tls import configure_tls_environment
+
+configure_tls_environment()
+
 from opend_copytrader.server import run
 
 

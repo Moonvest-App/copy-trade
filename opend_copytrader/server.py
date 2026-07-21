@@ -74,6 +74,18 @@ class Application:
             "events": self.store.list_events(50),
         }
 
+    def discover_accounts(self, broker: str | None = None) -> list[dict[str, Any]]:
+        """Discover accounts for the broker currently selected in the UI.
+
+        The selected broker does not need to be persisted first. SettingsStore
+        returns a detached copy, so this probe cannot change the active trading
+        configuration or arm/disarm state.
+        """
+        settings = self.settings.get()
+        settings.broker = str(broker or settings.broker).strip().lower()
+        settings.validate()
+        return self.adapter.accounts(settings)
+
 
 class LocalServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -205,7 +217,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         return self._json(self.app.adapter.robinhood.health(self.app.settings.get()))
 
     def _get_accounts(self, query: dict[str, list[str]]) -> None:
-        return self._json({"accounts": self.app.adapter.accounts(self.app.settings.get())})
+        broker = str(query.get("broker", [""])[0]).strip().lower() or None
+        return self._json({"accounts": self.app.discover_accounts(broker)})
 
     def _get_broker_credentials(self, query: dict[str, list[str]]) -> None:
         broker = str(query.get("broker", [self.app.settings.get().broker])[0]).strip().lower()

@@ -14,6 +14,7 @@ from typing import Any
 
 from . import __version__ as APP_VERSION
 from .models import OrderResult, Quote
+from .tls import trusted_ssl_context
 
 
 MCP_ENDPOINT = "https://agent.robinhood.com/mcp/trading"
@@ -171,7 +172,9 @@ class RobinhoodMCPAdapter:
     ) -> tuple[Any, Any]:
         request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=timeout, context=trusted_ssl_context()
+            ) as response:
                 raw = response.read(4_000_000)
                 return _json_from_text(raw.decode("utf-8", errors="replace")), response.headers
         except urllib.error.HTTPError as exc:
@@ -326,7 +329,9 @@ class RobinhoodMCPAdapter:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=25) as response:
+            with urllib.request.urlopen(
+                request, timeout=25, context=trusted_ssl_context()
+            ) as response:
                 raw = response.read(4_000_000)
                 session = str(response.headers.get("Mcp-Session-Id") or "")
                 if session:

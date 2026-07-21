@@ -357,6 +357,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let stderr = Pipe()
         process.executableURL = executable
         process.arguments = ["--no-browser", "--port", "8899", "--ready-file", ready.path]
+        let caFile = executable
+            .deletingLastPathComponent()
+            .appendingPathComponent("_internal/certifi/cacert.pem")
+        if FileManager.default.isReadableFile(atPath: caFile.path) {
+            var environment = ProcessInfo.processInfo.environment
+            environment["SSL_CERT_FILE"] = caFile.path
+            environment["REQUESTS_CA_BUNDLE"] = caFile.path
+            process.environment = environment
+        }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = stderr
         // 必须持续排空 stderr：管道缓冲约 64KB，写满后后端会在写 stderr 时

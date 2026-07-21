@@ -20,6 +20,7 @@ from .config import SettingsStore
 from .engine import CopyEngine
 from .instruments import OptionContract
 from .store import LocalStore
+from .tls import trusted_ssl_context
 
 
 MOONVEST_ENDPOINT = "https://stream.moonvest.app/v1/active_trades/subscribe"
@@ -377,6 +378,8 @@ class MoonvestStream:
         self.engine = engine
         self.credentials = credentials
         self._opener = opener or urllib.request.urlopen
+        self._uses_default_opener = opener is None or opener is urllib.request.urlopen
+        self._ssl_context = trusted_ssl_context()
         self._resync_handler = resync_handler
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -527,7 +530,10 @@ class MoonvestStream:
         url = f"{MOONVEST_ENDPOINT}?{urllib.parse.urlencode(params)}"
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with self._opener(request, timeout=90) as response:
+            open_kwargs: dict[str, Any] = {"timeout": 90}
+            if self._uses_default_opener:
+                open_kwargs["context"] = self._ssl_context
+            with self._opener(request, **open_kwargs) as response:
                 with self._status_lock:
                     self._response = response
                     superseded = generation != self._reconnect_generation
