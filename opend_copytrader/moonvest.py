@@ -19,6 +19,7 @@ from .broker_adapters import KeychainStore
 from .config import SettingsStore
 from .engine import CopyEngine
 from .instruments import OptionContract
+from .models import CopySignal
 from .store import LocalStore
 from .tls import trusted_ssl_context
 
@@ -372,6 +373,7 @@ class MoonvestStream:
         *,
         opener: Callable[..., Any] | None = None,
         resync_handler: Callable[[], dict[str, Any]] | None = None,
+        diagnostic: Callable[..., None] | None = None,
     ):
         self.settings = settings
         self.store = store
@@ -381,6 +383,7 @@ class MoonvestStream:
         self._uses_default_opener = opener is None or opener is urllib.request.urlopen
         self._ssl_context = trusted_ssl_context()
         self._resync_handler = resync_handler
+        self._diagnostic = diagnostic
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -396,6 +399,14 @@ class MoonvestStream:
             "resync_count": 0,
             "resync_required": False,
         }
+
+    def _trace(self, event: str, **fields: Any) -> None:
+        if self._diagnostic is None:
+            return
+        try:
+            self._diagnostic(event, **fields)
+        except Exception:
+            pass
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -501,6 +512,12 @@ class MoonvestStream:
         was_connected = bool(self.status().get("connected"))
         reconnect_count = int(self.status().get("reconnect_count") or 0) + 1
         self._set_status(connected=False, last_error=reason[:500], reconnect_count=reconnect_count)
+        self._trace(
+            "moonvest.sse.disconnected",
+            reason=reason[:500],
+            reconnect_count=reconnect_count,
+            execution_was_armed=bool(self.engine.state().get("armed")),
+        )
         if was_connected and self.engine.state().get("armed"):
             self.engine.disarm()
             self.store.event(
@@ -528,6 +545,12 @@ class MoonvestStream:
             else:
                 headers["Last-Event-ID"] = cursor
         url = f"{MOONVEST_ENDPOINT}?{urllib.parse.urlencode(params)}"
+        self._trace(
+            "moonvest.sse.connecting",
+            follow_count=len(settings.moonvest_follow),
+            cursor_configured=bool(cursor),
+            cursor_mode=settings.moonvest_cursor_mode,
+        )
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
             open_kwargs: dict[str, Any] = {"timeout": 90}
@@ -540,6 +563,12 @@ class MoonvestStream:
                 if superseded:
                     return True
                 self._set_status(connected=True, last_error="")
+                self._trace(
+                    "moonvest.sse.connected",
+                    follow_count=len(settings.moonvest_follow),
+                    cursor_configured=bool(cursor),
+                    cursor_mode=settings.moonvest_cursor_mode,
+                )
                 for frame in iter_sse_frames(response):
                     if self._stop.is_set():
                         return False
@@ -563,19 +592,12 @@ class MoonvestStream:
                 self._response = None
 
     def _handle_trade(self, frame: SSEFrame) -> None:
+        decoded: Any = None
         try:
             decoded = json.loads(frame.data)
             payload = normalize_trade_payload(decoded, frame.event_id)
         except Exception as exc:
-            cursor = frame.event_id
-            self.store.event(
-                "moonvest.invalid_event",
-                f"Moonvest 事件校验失败：{exc}",
-                level="error",
-                details={"event_id": cursor},
-            )
-            if cursor:
-                self.store.set_meta(CURSOR_META_KEY, cursor)
+            self._quarantine(frame, exc, decoded)
             return
 
         event_id = payload["id"]
@@ -584,12 +606,7 @@ class MoonvestStream:
             try:
                 self.engine.submit(trade_to_signal(payload), source="moonvest")
             except Exception as exc:
-                self.store.event(
-                    "moonvest.event_rejected",
-                    f"Moonvest 事件无法形成安全的本地记录：{exc}",
-                    level="error",
-                    details={"event_id": event_id, "actor": payload.get("actor")},
-                )
+                self._quarantine(frame, exc, payload)
         self.store.upsert_moonvest_position(moonvest_position_key(payload), payload)
         # Advance only after the durable signal/state work is complete.
         self.store.set_meta(CURSOR_META_KEY, event_id)
@@ -605,6 +622,74 @@ class MoonvestStream:
                 "Moonvest 重投事件已按 id 去重",
                 details={"event_id": event_id},
             )
+
+    def _quarantine(self, frame: SSEFrame, error: Exception, payload: Any) -> None:
+        """Durably reject one bad business event while keeping the SSE alive."""
+        external_id = frame.event_id or f"invalid-{hashlib.sha256(frame.data.encode('utf-8')).hexdigest()[:24]}"
+        reason = f"Moonvest 事件处理失败，已隔离且未下单：{str(error) or type(error).__name__}"
+        source = payload if isinstance(payload, dict) else {}
+        symbol = str(source.get("symbol") or "UNKNOWN").strip().upper()
+        if not SYMBOL_RE.fullmatch(symbol):
+            symbol = "UNKNOWN"
+        action = {
+            "opened": "OPEN",
+            "added_to": "ADD",
+            "partially_closed": "TRIM",
+            "closed": "CLOSE",
+            "edited": "EDIT",
+            "expired": "EXPIRE",
+        }.get(str(source.get("action") or "").strip().lower(), "OPEN")
+        side = str(source.get("side") or "buy").strip().upper()
+        if side not in {"BUY", "SELL"}:
+            side = "BUY"
+        signal = CopySignal(
+            source="moonvest",
+            external_id=external_id,
+            code=f"US.{symbol}",
+            side=side,
+            quantity=0.0,
+            action=action,
+            leader=str(source.get("actor") or ""),
+            note="Moonvest SSE 事件隔离",
+            raw={
+                "event": frame.event,
+                "event_id": frame.event_id,
+                "payload": payload if isinstance(payload, dict) else str(payload or frame.data)[:4000],
+                "processing_error": str(error)[:500],
+            },
+        )
+        row, created = self.store.insert_signal(signal)
+        if row and (created or row.get("status") not in {"PLACED", "FILLED"}):
+            row = self.store.update_signal(row["id"], status="REJECTED", reason=reason) or row
+        self.store.event(
+            "moonvest.signal_quarantined",
+            reason,
+            level="error",
+            signal_id=row.get("id") if row else None,
+            details={
+                "event_id": frame.event_id,
+                "error_type": type(error).__name__,
+            },
+        )
+        was_armed = bool(self.engine.state().get("armed"))
+        if was_armed:
+            self.engine.disarm()
+            self.store.event(
+                "moonvest.execution_closed",
+                "收到无法安全处理的 Moonvest 事件；该条已隔离，SSE 继续运行，订单执行已关闭",
+                level="warning",
+                signal_id=row.get("id") if row else None,
+            )
+        if frame.event_id:
+            self.store.set_meta(CURSOR_META_KEY, frame.event_id)
+        self._set_status(last_event_at=self._timestamp())
+        self._trace(
+            "moonvest.trade.quarantined",
+            event_id=frame.event_id,
+            error=str(error),
+            error_type=type(error).__name__,
+            execution_closed=was_armed,
+        )
 
     def _handle_resync(self, frame: SSEFrame) -> None:
         try:
@@ -623,6 +708,12 @@ class MoonvestStream:
                 snapshot = {"broker_snapshot_error": str(exc)}
         count = int(self.status().get("resync_count") or 0) + 1
         self._set_status(resync_count=count, resync_required=True)
+        self._trace(
+            "moonvest.sse.resync",
+            reason=payload.get("reason"),
+            stale_positions=stale,
+            execution_closed=True,
+        )
         self.store.event(
             "moonvest.resync",
             "Moonvest cursor 已过期：已标记来源状态为待同步、重新读取券商持仓并关闭订单执行；SSE 将继续接收实时事件",

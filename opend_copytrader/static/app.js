@@ -1,16 +1,57 @@
 const LOCAL_HEADERS = { "Content-Type": "application/json", "X-Local-App": "moonvest" };
-const state = { dashboard: null, accounts: [], accountRequest: 0, activeView: "dashboard", timer: null, robinhoodConnected: undefined };
+const state = { dashboard: null, accounts: [], accountRequest: 0, activeView: "dashboard", timer: null, robinhoodConnected: undefined, executionBlockers: [] };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { cache: "no-store", ...options });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`);
-  return data;
+  const { timeoutMs = 15000, ...fetchOptions } = options;
+  const controller = new AbortController();
+  let timer;
+  const timeoutError = new Error(`请求等待超过 ${Math.round(timeoutMs / 1000)} 秒，已停止等待；请先刷新状态，必要时导出诊断包`);
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  try {
+    const request = (async () => {
+      const response = await fetch(path, { cache: "no-store", ...fetchOptions, signal: controller.signal });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`);
+      return data;
+    })();
+    return await Promise.race([request, deadline]);
+  } catch (error) {
+    const normalized = error?.name === "AbortError" ? timeoutError : error;
+    // 只记录安全摘要；请求正文可能包含 API key 或券商凭证。
+    console.error(`[Moonvest 本机 API] ${safeApiPath(path)} 失败`, {
+      name: normalized?.name || "Error",
+      timedOut: normalized === timeoutError,
+    });
+    throw normalized;
+  } finally {
+    clearTimeout(timer);
+  }
 }
-async function mutate(path, body = {}, method = "POST") {
-  return api(path, { method, headers: LOCAL_HEADERS, body: JSON.stringify(body) });
+async function mutate(path, body = {}, method = "POST", timeoutMs = 30000) {
+  return api(path, { method, headers: LOCAL_HEADERS, body: JSON.stringify(body), timeoutMs });
+}
+function beginButtonBusy(button, label) {
+  if (!button) return () => {};
+  const previousText = button.textContent;
+  const previousDisabled = button.disabled;
+  button.disabled = true;
+  if (label) button.textContent = label;
+  return () => {
+    button.disabled = previousDisabled;
+    button.textContent = previousText;
+  };
+}
+function safeApiPath(path) {
+  return String(path)
+    .split("?")[0]
+    .replace(/\/api\/signals\/[^/]+/g, "/api/signals/<id>");
 }
 function esc(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
@@ -55,12 +96,19 @@ async function loadDashboard(quiet = false) {
     const chip = $("#connection-chip");
     chip.className = "status-chip offline";
     chip.querySelector("span").textContent = "本机服务不可用";
+    const sourceChip = $("#source-chip");
+    sourceChip.className = "status-chip offline";
+    sourceChip.querySelector("span").textContent = "Moonvest 状态不可用";
     if (!quiet) toast(error.message, true);
   }
 }
 
 function renderDashboard(data) {
   const { health, settings, engine, moonvest, moonvest_positions: sourcePositions, signals, events, daily_notional: daily } = data;
+  if (data.app_version) {
+    const version = $("#app-version");
+    if (version) version.textContent = `v${data.app_version}`;
+  }
   const brokerLabel = health.broker_label || BROKER_LABELS[settings.broker] || settings.broker;
   const capabilities = health.capabilities || {};
   const chip = $("#connection-chip");
@@ -87,7 +135,21 @@ function renderDashboard(data) {
   $("#pause-button").textContent = engine.paused ? "恢复" : "暂停";
   $("#arm-button").textContent = engine.armed ? "关闭执行" : "启用执行";
   $("#arm-button").className = engine.armed ? "btn danger" : "btn primary";
-  $("#arm-button").disabled = !engine.armed && capabilities.execution === false;
+  const executionBlockers = [];
+  if (settings.mode === "observe") executionBlockers.push("跟单模式仍为“仅观察”");
+  if (!selectedAccount) executionBlockers.push("尚未选择券商执行账户");
+  if (!moonvest?.api_key_configured) executionBlockers.push("尚未配置 Moonvest API key");
+  if (!(settings.moonvest_follow || []).length) executionBlockers.push("尚未配置 Moonvest follow 用户");
+  if (moonvest?.resync_required) executionBlockers.push("Moonvest cursor 已过期，来源持仓仍待重新同步");
+  else if (!moonvest?.connected) executionBlockers.push(`Moonvest SSE 未在线${moonvest?.last_error ? `：${moonvest.last_error}` : ""}`);
+  if (!health.connected) executionBlockers.push(`${brokerLabel} 未连接${health.error ? `：${health.error}` : ""}`);
+  else if (capabilities.execution === false) executionBlockers.push(capabilities.status || `${brokerLabel} 当前账户只读，不能执行订单`);
+  state.executionBlockers = executionBlockers;
+  const readiness = $("#execution-readiness");
+  readiness.hidden = engine.armed || !executionBlockers.length;
+  $("#execution-readiness-detail").textContent = executionBlockers.join("；");
+  $("#arm-button").setAttribute("aria-disabled", !engine.armed && executionBlockers.length ? "true" : "false");
+  $("#arm-button").title = !engine.armed && executionBlockers.length ? executionBlockers[0] : "";
 
   renderSourcePositions(sourcePositions || []);
   renderRecent(signals || []);
@@ -108,6 +170,10 @@ function renderMoonvest(status) {
   const connected = Boolean(status.connected);
   const configured = Boolean(status.api_key_configured && (status.follow || []).length);
   const label = status.resync_required ? "待核对" : connected ? "实时流在线" : configured ? "正在重连" : "等待配置";
+  const sourceChip = $("#source-chip");
+  sourceChip.className = `status-chip${connected && !status.resync_required ? "" : status.resync_required || configured ? " pending" : " offline"}`;
+  sourceChip.querySelector("span").textContent = status.resync_required ? "Moonvest 待同步" : connected ? "Moonvest SSE 在线" : configured ? "Moonvest SSE 重连中" : "Moonvest 未配置";
+  sourceChip.title = status.last_error || "";
   $("#stat-moonvest").textContent = label;
   const cursor = status.cursor ? `cursor …${String(status.cursor).slice(-10)}` : "live tail";
   $("#stat-moonvest-detail").textContent = `${(status.follow || []).join(", ") || "未配置 follow"} · ${cursor}`;
@@ -234,7 +300,7 @@ function renderBrokerConfig(broker, health = null) {
   const robinhoodConnected = broker === "robinhood" && Boolean(health?.connected);
   if (robinhoodStatus) {
     robinhoodStatus.textContent = robinhoodConnected
-      ? `官方 OAuth 已连接 · 已载入 ${health.tool_count || 0} 个 MCP 工具 · 仅 Agentic 账户可执行`
+      ? `官方 OAuth 已连接 · 已载入 ${health.tool_count || 0} 个 MCP 工具 · ${health?.capabilities?.status || "仅 Agentic 账户可执行"}`
       : health?.error || "点击连接后在 Robinhood 官方页面完成授权，无需输入密钥。";
   }
   if ($("#connect-robinhood")) $("#connect-robinhood").disabled = robinhoodConnected;
@@ -248,41 +314,62 @@ function markSettingsDirty() { $("#settings-form").dataset.dirty = "true"; }
 async function saveMoonvestKey() {
   const field = $("#moonvest-api-key");
   if (!field.value.trim()) throw new Error("请输入 Moonvest API key");
-  const result = await mutate("/api/moonvest/credentials", { api_key: field.value });
-  field.value = "";
-  toast("Moonvest API key 已保存到 macOS 登录钥匙串");
-  renderMoonvest({ ...(state.dashboard?.moonvest || {}), ...result });
-  await loadDashboard(true);
+  const finish = beginButtonBusy($("#save-moonvest-key"), "正在保存…");
+  try {
+    const result = await mutate("/api/moonvest/credentials", { api_key: field.value });
+    field.value = "";
+    toast("Moonvest API key 已保存到 macOS 登录钥匙串");
+    renderMoonvest({ ...(state.dashboard?.moonvest || {}), ...result });
+    await loadDashboard(true);
+  } finally {
+    finish();
+  }
 }
 async function clearMoonvestKey() {
   if (!window.confirm("确定从 macOS 登录钥匙串清除 Moonvest API key 吗？")) return;
-  await mutate("/api/moonvest/credentials", { clear: true });
-  toast("Moonvest API key 已清除");
-  await loadDashboard(true);
+  const finish = beginButtonBusy($("#clear-moonvest-key"), "正在清除…");
+  try {
+    await mutate("/api/moonvest/credentials", { clear: true });
+    toast("Moonvest API key 已清除");
+    await loadDashboard(true);
+  } finally {
+    finish();
+  }
 }
 
 async function applyMoonvestCursor() {
   const field = $("#moonvest-cursor-input");
   const cursor = field.value.trim();
   if (!cursor) throw new Error("请输入要恢复的 Moonvest cursor；如需 live tail 请点击清空 cursor");
-  if ($("#settings-form").dataset.dirty === "true") await persistFormSettings(false);
-  await mutate("/api/moonvest/cursor", { cursor });
-  field.dataset.edited = "false";
-  toast("恢复 cursor 已保存，Moonvest 正在回放并重连");
-  await loadDashboard(true);
+  const finish = beginButtonBusy($("#apply-moonvest-cursor"), "正在应用…");
+  try {
+    if ($("#settings-form").dataset.dirty === "true") await persistFormSettings(false);
+    await mutate("/api/moonvest/cursor", { cursor });
+    field.dataset.edited = "false";
+    toast("恢复 cursor 已保存，Moonvest 正在回放并重连");
+    await loadDashboard(true);
+  } finally {
+    finish();
+  }
 }
 
 async function clearMoonvestCursor() {
   if (!window.confirm("确定清空 Moonvest cursor 并从 live tail 继续吗？")) return;
-  await mutate("/api/moonvest/cursor", { cursor: "" });
-  const field = $("#moonvest-cursor-input");
-  field.value = "";
-  field.dataset.edited = "false";
-  toast("Moonvest cursor 已清空，正在连接 live tail");
-  await loadDashboard(true);
+  const finish = beginButtonBusy($("#clear-moonvest-cursor"), "正在清空…");
+  try {
+    await mutate("/api/moonvest/cursor", { cursor: "" });
+    const field = $("#moonvest-cursor-input");
+    field.value = "";
+    field.dataset.edited = "false";
+    toast("Moonvest cursor 已清空，正在连接 live tail");
+    await loadDashboard(true);
+  } finally {
+    finish();
+  }
 }
 
 async function saveBrokerCredentials(broker) {
+  const finish = beginButtonBusy($(broker === "webull" ? "#save-webull-credentials" : "#save-schwab-credentials"), "正在保存…");
   const payload = { broker };
   if (broker === "webull") {
     payload.app_secret = $("#webull-app-secret").value;
@@ -292,32 +379,60 @@ async function saveBrokerCredentials(broker) {
     payload.access_token = $("#schwab-access-token").value;
     payload.refresh_token = $("#schwab-refresh-token").value;
   }
-  const result = await mutate("/api/broker/credentials", payload);
-  $$(`[data-broker-config="${broker}"] .secret-input`).forEach((field) => { field.value = ""; });
-  renderCredentialStatus(broker, result.status || {});
-  toast(`${BROKER_LABELS[broker]} API 凭证已保存到 macOS 钥匙串`);
-  await loadDashboard(true);
+  try {
+    const result = await mutate("/api/broker/credentials", payload);
+    $$(`[data-broker-config="${broker}"] .secret-input`).forEach((field) => { field.value = ""; });
+    renderCredentialStatus(broker, result.status || {});
+    toast(`${BROKER_LABELS[broker]} API 凭证已保存到 macOS 钥匙串`);
+    await loadDashboard(true);
+  } finally {
+    finish();
+  }
 }
 async function clearBrokerCredentials(broker) {
   if (!window.confirm(`确定清除 ${BROKER_LABELS[broker]} 的全部 API 凭证吗？`)) return;
-  const result = await mutate("/api/broker/credentials", { broker, clear: true });
-  renderCredentialStatus(broker, result.status || {});
-  toast(`${BROKER_LABELS[broker]} API 凭证已清除`);
+  const finish = beginButtonBusy($(`.clear-broker-credentials[data-broker="${broker}"]`), "正在清除…");
+  try {
+    const result = await mutate("/api/broker/credentials", { broker, clear: true });
+    renderCredentialStatus(broker, result.status || {});
+    toast(`${BROKER_LABELS[broker]} API 凭证已清除`);
+  } finally {
+    finish();
+  }
 }
 
 async function connectRobinhood() {
   const selected = document.querySelector('input[name="broker"]:checked')?.value;
   if (selected !== "robinhood") throw new Error("请先选择 Robinhood");
-  await mutate("/api/robinhood/oauth/start");
-  toast("已打开 Robinhood 官方授权页面；完成后返回 Moonvest 即可");
+  const finish = beginButtonBusy($("#connect-robinhood"), "正在连接…");
+  try {
+    const result = await mutate("/api/robinhood/oauth/start", {}, "POST", 18000);
+    const authLink = $("#robinhood-auth-link");
+    if (result.authorization_url) {
+      authLink.href = result.authorization_url;
+      authLink.hidden = false;
+    }
+    toast(result.opened_external ? "已打开 Robinhood 官方授权页面；完成后返回 Moonvest 即可" : "浏览器未能自动打开，请点击下方授权链接继续", !result.opened_external);
+  } finally {
+    finish();
+  }
 }
 
 async function disconnectRobinhood() {
   if (!window.confirm("确定断开 Robinhood 官方 MCP 授权吗？")) return;
-  await mutate("/api/robinhood/oauth/disconnect");
-  toast("Robinhood 已断开");
-  state.robinhoodConnected = false;
-  await loadDashboard(true);
+  const finish = beginButtonBusy($("#disconnect-robinhood"), "正在断开…");
+  try {
+    await mutate("/api/robinhood/oauth/disconnect");
+    toast("Robinhood 已断开");
+    state.robinhoodConnected = false;
+    const authLink = $("#robinhood-auth-link");
+    authLink.hidden = true;
+    authLink.removeAttribute("href");
+    await loadDashboard(true);
+  } finally {
+    finish();
+    if (!state.robinhoodConnected) $("#disconnect-robinhood").disabled = true;
+  }
 }
 
 async function loadAccounts(quiet = false) {
@@ -325,38 +440,50 @@ async function loadAccounts(quiet = false) {
   const requestId = ++state.accountRequest;
   const select = $("#account-select");
   const note = $("#account-discovery-note");
+  const reloadButton = $("#reload-accounts");
   const previousSelection = select.value;
   const formWasDirty = $("#settings-form").dataset.dirty === "true";
+  if (reloadButton) {
+    reloadButton.disabled = true;
+    reloadButton.textContent = "正在发现…";
+  }
   if (note) note.textContent = `正在从 ${BROKER_LABELS[broker] || broker} 自动发现账户…`;
   if (!quiet) toast(`正在从 ${BROKER_LABELS[broker] || broker} 发现账户…`);
-  const data = await api(`/api/accounts?broker=${encodeURIComponent(broker)}`);
-  const visibleBroker = document.querySelector('input[name="broker"]:checked')?.value || state.dashboard?.settings.broker || "moomoo";
-  if (requestId !== state.accountRequest || visibleBroker !== broker) return;
-  state.accounts = data.accounts || [];
-  const selectable = state.accounts.filter((account) => account.selectable);
-  select.innerHTML = [`<option value="">请选择账户</option>`, ...selectable.map((account) => `<option value="${esc(accountKey(account))}">${esc(account.display_name)}</option>`)].join("");
-  const savedSettings = state.dashboard?.settings || {};
-  const savedAccount = savedSettings.broker === broker ? selectedBrokerAccount(savedSettings) : "";
-  if (previousSelection && [...select.options].some((option) => option.value === previousSelection)) {
-    select.value = previousSelection;
-  } else if (savedAccount) {
-    setAccountSelection(select, broker, broker === "moomoo" ? savedSettings.security_firm : broker.toUpperCase(), savedAccount, savedSettings.trading_env);
-  }
-  if (!select.value && selectable.length === 1) {
-    select.value = accountKey(selectable[0]);
-    if (!formWasDirty && !savedAccount) {
-      await persistDiscoveredAccount(selectable[0]);
-      if (note) note.textContent = `已自动连接并选中 ${selectable[0].display_name}。`;
-    } else {
-      markSettingsDirty();
-      if (note) note.textContent = `已自动选中 ${selectable[0].display_name}，保存设置即可使用。`;
+  try {
+    const data = await api(`/api/accounts?broker=${encodeURIComponent(broker)}`, { timeoutMs: 35000 });
+    const visibleBroker = document.querySelector('input[name="broker"]:checked')?.value || state.dashboard?.settings.broker || "moomoo";
+    if (requestId !== state.accountRequest || visibleBroker !== broker) return;
+    state.accounts = data.accounts || [];
+    const selectable = state.accounts.filter((account) => account.selectable);
+    select.innerHTML = [`<option value="">请选择账户</option>`, ...selectable.map((account) => `<option value="${esc(accountKey(account))}">${esc(account.display_name)}</option>`)].join("");
+    const savedSettings = state.dashboard?.settings || {};
+    const savedAccount = savedSettings.broker === broker ? selectedBrokerAccount(savedSettings) : "";
+    if (previousSelection && [...select.options].some((option) => option.value === previousSelection)) {
+      select.value = previousSelection;
+    } else if (savedAccount) {
+      setAccountSelection(select, broker, broker === "moomoo" ? savedSettings.security_firm : broker.toUpperCase(), savedAccount, savedSettings.trading_env);
     }
-  } else if (selectable.length) {
-    if (note) note.textContent = select.value ? "账户已自动载入。" : `发现 ${selectable.length} 个可用账户，请选择执行账户。`;
-  } else if (note) {
-    note.textContent = broker === "moomoo" ? "未发现可用账户，请确认 moomoo OpenD 已启动并已登录。" : broker === "robinhood" ? "未发现 Agentic 账户，请先完成 Robinhood 官方授权与开户。" : "未发现可用账户，请检查券商连接。";
+    if (!select.value && selectable.length === 1) {
+      select.value = accountKey(selectable[0]);
+      if (!formWasDirty && !savedAccount) {
+        await persistDiscoveredAccount(selectable[0]);
+        if (note) note.textContent = `已自动连接并选中 ${selectable[0].display_name}。`;
+      } else {
+        markSettingsDirty();
+        if (note) note.textContent = `已自动选中 ${selectable[0].display_name}，保存设置即可使用。`;
+      }
+    } else if (selectable.length) {
+      if (note) note.textContent = select.value ? "账户已自动载入。" : `发现 ${selectable.length} 个可用账户，请选择执行账户。`;
+    } else if (note) {
+      note.textContent = broker === "moomoo" ? "未发现可用账户，请确认 moomoo OpenD 已启动并已登录。" : broker === "robinhood" ? "未发现 Agentic 账户，请先完成 Robinhood 官方授权与开户。" : "未发现可用账户，请检查券商连接。";
+    }
+    if (!quiet) toast(selectable.length ? `已发现 ${selectable.length} 个可用账户` : "没有发现可用账户", !selectable.length);
+  } finally {
+    if (reloadButton && requestId === state.accountRequest) {
+      reloadButton.disabled = false;
+      reloadButton.textContent = "刷新账户";
+    }
   }
-  if (!quiet) toast(selectable.length ? `已发现 ${selectable.length} 个可用账户` : "没有发现可用账户", !selectable.length);
 }
 
 async function persistDiscoveredAccount(account) {
@@ -454,15 +581,14 @@ async function armToggle() {
     await mutate("/api/engine/disarm");
     toast("订单执行已关闭");
   } else {
-    if (dashboard.settings.mode === "observe") return showView("settings", "请先切换到人工确认或自动跟单");
-    if (dashboard.moonvest.resync_required && !window.confirm("最近发生过 resync，来源状态已标记待核对。确认已核对券商持仓并继续启用执行吗？")) return;
+    if (state.executionBlockers.length) return showView("settings", `执行尚未就绪：${state.executionBlockers[0]}`);
     let manual = false;
     if (dashboard.settings.trading_env === "REAL") {
       manual = window.confirm("这将允许应用提交实盘订单。请确认已在券商端完成授权/解锁，并已核对账户与限额。是否继续？");
       if (!manual) return;
     }
     await mutate("/api/engine/arm", { manual_unlock_confirmed: manual });
-    toast("订单执行已启用，4 小时后自动关闭");
+    toast("订单执行已启用，8 小时后自动关闭");
   }
   await loadDashboard(true);
 }
@@ -487,7 +613,10 @@ async function signalAction(event) {
 
 async function loadPortfolio() {
   try {
-    const [portfolio, orders] = await Promise.all([api("/api/portfolio"), api("/api/orders")]);
+    const [portfolio, orders] = await Promise.all([
+      api("/api/portfolio", { timeoutMs: 35000 }),
+      api("/api/orders", { timeoutMs: 35000 }),
+    ]);
     renderPortfolio(portfolio, orders.orders || []);
   } catch (error) { toast(error.message, true); }
 }
@@ -503,6 +632,23 @@ function renderPortfolio(portfolio, orders) {
 }
 async function loadSignals() { try { const data = await api("/api/signals?limit=300"); renderAllSignals(data.signals || []); } catch (error) { toast(error.message, true); } }
 async function loadEvents() { try { const data = await api("/api/events?limit=300"); renderEvents(data.events || []); } catch (error) { toast(error.message, true); } }
+async function exportDiagnostics() {
+  const button = $("#export-diagnostics");
+  const resultBox = $("#diagnostic-export-result");
+  const finish = beginButtonBusy(button, "正在整理诊断包…");
+  try {
+    const result = await mutate("/api/diagnostics/export", {}, "POST", 20000);
+    resultBox.textContent = `已导出到“下载”文件夹：${result.filename}`;
+    resultBox.className = "diagnostic-export-result ready";
+    toast("脱敏诊断包已导出到下载文件夹");
+  } catch (error) {
+    resultBox.textContent = error.message;
+    resultBox.className = "diagnostic-export-result error";
+    throw error;
+  } finally {
+    finish();
+  }
+}
 
 function showView(name, message) {
   state.activeView = name;
@@ -549,6 +695,7 @@ function bind() {
   $("#refresh-portfolio").addEventListener("click", loadPortfolio);
   $("#refresh-signals").addEventListener("click", loadSignals);
   $("#refresh-events").addEventListener("click", loadEvents);
+  $("#export-diagnostics").addEventListener("click", () => exportDiagnostics().catch((error) => toast(error.message, true)));
   window.addEventListener("focus", () => {
     const broker = document.querySelector('input[name="broker"]:checked')?.value;
     if (broker === "robinhood") loadAccounts(true).catch(() => {});

@@ -1,4 +1,4 @@
-Moonvest 1.2.2
+Moonvest 1.4.0
 macOS Apple Silicon（M1 / M2 / M3 / M4 系列）分享版
 
 安装步骤
@@ -26,11 +26,17 @@ macOS 首次打开提示
 - 唯一开单信息源是 Moonvest Active Trades SSE；没有手动单、Webhook 或其他来源入口。
 - 事件 id 用于持久去重、cursor 恢复和下游幂等标识。
 - SSE 断线或 resync 会自动关闭订单执行；连接恢复不会自动重新启用下单。
-- “启用执行”是独立的临时开关，4 小时后自动关闭。
-- moomoo OpenD 支持股票与单腿期权执行。Robinhood 通过官方 Trading MCP 支持美股/ETF 执行，并强制先预检再下单；普通 Robinhood 账户只读，只有独立 Agentic 账户可执行。IBKR、Webull 与嘉信仍为只读接入。
+- “启用执行”是独立的临时开关，8 小时后自动关闭。
+- moomoo OpenD 支持股票与单腿期权执行。Robinhood 通过官方 Trading MCP 支持美股/ETF 与单腿期权，并强制先预检再下单；普通 Robinhood 账户只读，只有独立 Agentic 账户可执行。IBKR、Webull 与嘉信仍为只读接入。
 - moomoo 实盘必须先在 OpenD GUI 中由使用者手动解锁。
 - 所有个人配置与审计数据只保存在接收者自己的：
   ~/Library/Application Support/Moonvest/
+
+调试与诊断
+
+- 在“审计日志”页面点击“导出诊断包”，脱敏 ZIP 会保存到“下载”文件夹，不包含 API key、券商凭证、账户号、订单号或持仓明细。
+- 按 F12 或 ⌘⌥I 可打开 Web Inspector；也可以使用顶部“开发”菜单。
+- 若连接按钮超时，按钮会自动恢复。先刷新状态；仍失败时导出诊断包交给维护者。
 
 系统要求
 

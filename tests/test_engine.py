@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import tempfile
+import time
 import unittest
 import unittest.mock
-from datetime import datetime
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -14,6 +17,7 @@ from zoneinfo import ZoneInfo
 from opend_copytrader.api_policy import ApiPacer, RateLimitError
 from opend_copytrader.broker_adapters import BrokerError, BrokerRouter, webull_signature
 from opend_copytrader.config import AppSettings, SettingsStore
+from opend_copytrader.diagnostics import DiagnosticRecorder
 from opend_copytrader.engine import CopyEngine
 from opend_copytrader.instruments import (
     broker_symbol,
@@ -27,12 +31,20 @@ from opend_copytrader.moonvest import (
     CURSOR_META_KEY,
     MoonvestCredentials,
     MoonvestStream,
+    SSEFrame,
     iter_sse_frames,
     moonvest_position_key,
     normalize_trade_payload,
     trade_to_signal,
 )
-from opend_copytrader.robinhood_mcp import RobinhoodMCPAdapter, parse_mcp_http_body
+from opend_copytrader.robinhood_mcp import (
+    RobinhoodMCPAdapter,
+    RobinhoodMCPError,
+    RobinhoodOrderRejected,
+    RobinhoodOrderUncertain,
+    RobinhoodRequestNotSent,
+    parse_mcp_http_body,
+)
 from opend_copytrader.server import Application
 from opend_copytrader.store import LocalStore
 from opend_copytrader.tls import bundled_ca_file, trusted_ssl_context
@@ -192,6 +204,15 @@ class CopyEngineTest(unittest.TestCase):
         self.assertEqual(placed["status"], "PLACED")
         expected = hashlib.sha256(b"event-1").hexdigest()[:20]
         self.assertEqual(self.broker.placed[0]["remark"], f"mv-{expected}")
+
+    def test_execution_arm_expires_after_eight_hours(self):
+        self.enable_confirm()
+        before = datetime.now(timezone.utc)
+        state = self.engine.arm()
+        armed_until = datetime.fromisoformat(state["armed_until"])
+
+        self.assertGreater((armed_until - before).total_seconds(), 7.9 * 60 * 60)
+        self.assertLess((armed_until - before).total_seconds(), 8.1 * 60 * 60)
 
     def test_sell_guard_prevents_unmanaged_sell(self):
         self.enable_confirm()
@@ -474,6 +495,40 @@ class MoonvestStreamTest(unittest.TestCase):
         self.assertEqual(self.store.list_moonvest_positions()[0]["stale"], 1)
         self.assertEqual(called, [True])
 
+    def test_bad_event_is_quarantined_advances_cursor_and_keeps_stream_alive(self):
+        self.settings.update({"mode": "confirm", "account_id": 123})
+        self.engine.arm()
+        stream = MoonvestStream(self.settings, self.store, self.engine, FakeCredentials())
+        stream._set_status(connected=True)
+        malformed = stock_event("bad-event", action="unsupported")
+
+        stream._handle_trade(SSEFrame("trade", "bad-event", json.dumps(malformed)))
+
+        quarantined = self.store.list_signals()[0]
+        self.assertEqual(quarantined["status"], "REJECTED")
+        self.assertIn("已隔离", quarantined["reason"])
+        self.assertEqual(self.store.get_meta(CURSOR_META_KEY), "bad-event")
+        self.assertFalse(self.engine.state()["armed"])
+        self.assertTrue(stream.status()["connected"])
+
+        valid = stock_event("good-event")
+        stream._handle_trade(SSEFrame("trade", "good-event", json.dumps(valid)))
+        self.assertEqual(self.store.get_meta(CURSOR_META_KEY), "good-event")
+        self.assertEqual(len(self.store.list_signals()), 2)
+
+    def test_live_stream_loss_disarms_but_does_not_pause_consumer(self):
+        self.settings.update({"mode": "confirm", "account_id": 123})
+        self.engine.arm()
+        stream = MoonvestStream(self.settings, self.store, self.engine, FakeCredentials())
+        stream._set_status(connected=True)
+
+        stream._lost("network interrupted")
+
+        self.assertFalse(stream.status()["connected"])
+        self.assertFalse(self.engine.state()["armed"])
+        self.assertFalse(self.engine.state()["paused"])
+        self.assertIn("network interrupted", stream.status()["last_error"])
+
 
 class CredentialTest(unittest.TestCase):
     def setUp(self):
@@ -579,6 +634,84 @@ class RobinhoodMCPTest(unittest.TestCase):
         def set(self, broker, name, value): self.values[(broker, name)] = value
         def delete(self, broker, name): self.values.pop((broker, name), None)
 
+    def ready_equity_adapter(self):
+        keychain = self.MemoryKeychain()
+        keychain.set("robinhood", "access_token", "test-token")
+        keychain.set("robinhood", "expires_at", str(time.time() + 3600))
+        adapter = RobinhoodMCPAdapter(keychain)
+        common = {
+            "account_number": {"type": "string"},
+            "symbol": {"type": "string"},
+            "side": {"type": "string", "enum": ["buy", "sell"]},
+            "quantity": {"type": "number"},
+            "order_type": {"type": "string", "enum": ["limit", "market"]},
+            "limit_price": {"type": "number"},
+        }
+        adapter._tools = {
+            "review_equity_order": {
+                "name": "review_equity_order",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": dict(common),
+                    "required": ["account_number", "symbol", "side", "quantity", "order_type"],
+                },
+            },
+            "place_equity_order": {
+                "name": "place_equity_order",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {**common, "ref_id": {"type": "string"}},
+                    "required": ["account_number", "symbol", "side", "quantity", "order_type", "ref_id"],
+                },
+            },
+        }
+        adapter._tools_at = time.monotonic()
+        adapter._account_cache = (time.monotonic(), [{
+            "acc_id": "agentic-2",
+            "agentic_allowed": True,
+            "selectable": True,
+        }])
+        return adapter
+
+    def ready_option_adapter(self):
+        adapter = self.ready_equity_adapter()
+        lookup_properties = {
+            "chain_symbol": {"type": "string"},
+            "expiration_date": {"type": "string"},
+            "strike_price": {"type": "number"},
+            "option_type": {"type": "string", "enum": ["call", "put"]},
+        }
+        order_properties = {
+            "account_number": {"type": "string"},
+            "contracts": {"type": "integer"},
+            "order_type": {"type": "string", "enum": ["limit", "market"]},
+            "legs": {"type": "array"},
+            "limit_price": {"type": "number"},
+        }
+        adapter._tools.update({
+            "get_option_instruments": {
+                "name": "get_option_instruments",
+                "inputSchema": {"type": "object", "properties": lookup_properties},
+            },
+            "review_option_order": {
+                "name": "review_option_order",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": dict(order_properties),
+                    "required": ["account_number", "contracts", "order_type", "legs"],
+                },
+            },
+            "place_option_order": {
+                "name": "place_option_order",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {**order_properties, "ref_id": {"type": "string"}},
+                    "required": ["account_number", "contracts", "order_type", "legs", "ref_id"],
+                },
+            },
+        })
+        return adapter
+
     def test_streamable_http_sse_response_is_parsed(self):
         payload = parse_mcp_http_body(
             b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n",
@@ -590,8 +723,8 @@ class RobinhoodMCPTest(unittest.TestCase):
         adapter = RobinhoodMCPAdapter(self.MemoryKeychain())
         adapter._call_tool = lambda name, arguments=None: {  # type: ignore[method-assign]
             "accounts": [
-                {"account_number": "regular-1", "type": "individual", "agentic_allowed": False},
-                {"account_number": "agentic-2", "type": "Agentic", "agentic_allowed": True},
+                {"account_number": "regular-1", "type": "individual", "profile": {"agentic_allowed": False}},
+                {"account_number": "agentic-2", "type": "individual", "capabilities": {"agentic_allowed": True}},
             ]
         }
         accounts = adapter.accounts(AppSettings())
@@ -600,14 +733,14 @@ class RobinhoodMCPTest(unittest.TestCase):
         self.assertTrue(accounts[1]["selectable"])
 
     def test_equity_order_is_reviewed_before_it_is_placed(self):
-        adapter = RobinhoodMCPAdapter(self.MemoryKeychain())
+        adapter = self.ready_equity_adapter()
         calls = []
 
         def fake_call(name, arguments=None):
             calls.append((name, arguments))
             if name == "place_equity_order":
                 return {"order_id": "rh-order-1", "status": "queued"}
-            return {"warnings": []}
+            return {"warnings": [], "accepted": True, "review_id": "review-1"}
 
         adapter._call_tool = fake_call  # type: ignore[method-assign]
         result = adapter.place_order(
@@ -621,7 +754,100 @@ class RobinhoodMCPTest(unittest.TestCase):
         )
         self.assertEqual([call[0] for call in calls], ["review_equity_order", "place_equity_order"])
         self.assertEqual(calls[0][1]["limit_price"], 201.25)
+        self.assertEqual(calls[0][1]["account_number"], "agentic-2")
+        self.assertTrue(calls[1][1]["ref_id"])
         self.assertEqual(result.order_id, "rh-order-1")
+
+    def test_review_block_is_definite_rejection_without_place(self):
+        adapter = self.ready_equity_adapter()
+        calls = []
+
+        def fake_call(name, arguments=None):
+            calls.append(name)
+            return {"accepted": False, "reason": "insufficient buying power"}
+
+        adapter._call_tool = fake_call  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RobinhoodOrderRejected, "预审未通过"):
+            adapter.place_order(
+                AppSettings(broker="robinhood", robinhood_account_id="agentic-2"),
+                code="US.AAPL", side="BUY", quantity=2, price=201.25,
+                order_type="NORMAL", remark="mv-review-reject",
+            )
+        self.assertEqual(calls, ["review_equity_order"])
+
+    def test_ambiguous_place_result_is_fail_closed(self):
+        adapter = self.ready_equity_adapter()
+
+        def fake_call(name, arguments=None):
+            if name == "place_equity_order":
+                raise RobinhoodMCPError("connection closed after send")
+            return {"accepted": True, "review_id": "review-1"}
+
+        adapter._call_tool = fake_call  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RobinhoodOrderUncertain, "结果无法确认"):
+            adapter.place_order(
+                AppSettings(broker="robinhood", robinhood_account_id="agentic-2"),
+                code="US.AAPL", side="BUY", quantity=2, price=201.25,
+                order_type="NORMAL", remark="mv-ambiguous-place",
+            )
+
+    def test_local_rate_guard_is_definite_not_sent_rejection(self):
+        adapter = self.ready_equity_adapter()
+
+        def fake_call(name, arguments=None):
+            if name == "place_equity_order":
+                raise RobinhoodRequestNotSent("local cooldown")
+            return {"accepted": True, "review_id": "review-1"}
+
+        adapter._call_tool = fake_call  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RobinhoodOrderRejected, "请求未发送"):
+            adapter.place_order(
+                AppSettings(broker="robinhood", robinhood_account_id="agentic-2"),
+                code="US.AAPL", side="BUY", quantity=2, price=201.25,
+                order_type="NORMAL", remark="mv-local-rate-guard",
+            )
+
+    def test_single_option_resolves_exact_uuid_then_reviews_and_places(self):
+        adapter = self.ready_option_adapter()
+        calls = []
+
+        def fake_call(name, arguments=None):
+            calls.append((name, arguments))
+            if name == "get_option_instruments":
+                return {"instruments": [{
+                    "id": "option-uuid-1",
+                    "chain_symbol": "NVDA",
+                    "expiration_date": "2026-09-18",
+                    "option_type": "call",
+                    "strike_price": "150",
+                    "state": "active",
+                }]}
+            if name == "review_option_order":
+                return {"accepted": True, "review_id": "option-review-1"}
+            return {"order_id": "option-order-1", "status": "queued"}
+
+        adapter._call_tool = fake_call  # type: ignore[method-assign]
+        result = adapter.place_order(
+            AppSettings(broker="robinhood", robinhood_account_id="agentic-2"),
+            code="US.NVDA260918C150000", side="BUY", quantity=1, price=4.25,
+            order_type="NORMAL", remark="mv-option-event", action="OPEN",
+        )
+
+        self.assertEqual([call[0] for call in calls], [
+            "get_option_instruments", "review_option_order", "place_option_order",
+        ])
+        self.assertEqual(calls[1][1]["legs"][0]["option_id"], "option-uuid-1")
+        self.assertEqual(calls[1][1]["legs"][0]["position_effect"], "open")
+        self.assertTrue(calls[2][1]["ref_id"])
+        self.assertEqual(result.order_id, "option-order-1")
+
+    def test_nested_instrument_id_is_not_mistaken_for_order_id(self):
+        with self.assertRaisesRegex(RobinhoodOrderUncertain, "未包含订单号"):
+            RobinhoodMCPAdapter._order_result(
+                {"status": "queued", "instrument": {"id": "instrument-only"}},
+                review={"accepted": True}, code="US.AAPL", side="BUY",
+                quantity=1, price=100, ref_id="stable-ref",
+            )
 
 
 class InstrumentPolicyTest(unittest.TestCase):
@@ -643,8 +869,85 @@ class InstrumentPolicyTest(unittest.TestCase):
         )
         self.assertIn("禁止新开仓", reason)
 
+    def test_polygon_option_symbol_is_normalized(self):
+        contract = parse_option_contract("O:NVDA260918C00150000")
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.to_moomoo(), "US.NVDA260918C150000")
+
 
 class SharedAppRegressionTest(unittest.TestCase):
+    def test_application_refuses_to_arm_while_moonvest_is_offline_or_resyncing(self):
+        app = Application.__new__(Application)
+        app.settings = SimpleNamespace(get=lambda: AppSettings(
+            mode="confirm", account_id=123, moonvest_follow=["alice"]
+        ))
+        app.moonvest_credentials = SimpleNamespace(api_key=lambda: "configured")
+        app.engine = SimpleNamespace(arm=lambda **kwargs: {"armed": True})
+        app.adapter = SimpleNamespace(
+            invalidate=lambda: None,
+            health=lambda settings: {"connected": True},
+        )
+        app.moonvest_stream = SimpleNamespace(status=lambda: {
+            "connected": False, "resync_required": False, "last_error": "reconnecting"
+        })
+        with self.assertRaisesRegex(ValueError, "SSE 未就绪"):
+            app.arm_engine()
+
+        app.moonvest_stream = SimpleNamespace(status=lambda: {
+            "connected": True, "resync_required": True, "last_error": ""
+        })
+        with self.assertRaisesRegex(ValueError, "resync"):
+            app.arm_engine()
+
+        app.moonvest_stream = SimpleNamespace(status=lambda: {
+            "connected": True, "resync_required": False, "last_error": ""
+        })
+        app.adapter = SimpleNamespace(
+            invalidate=lambda: None,
+            health=lambda settings: {"connected": False, "error": "OpenD offline"},
+        )
+        with self.assertRaisesRegex(ValueError, "券商连接未就绪"):
+            app.arm_engine()
+
+    def test_nullable_settings_are_normalized_before_validation(self):
+        settings = AppSettings(
+            broker=None,
+            opend_host=None,
+            opend_port=None,
+            allowed_markets=None,
+            allowed_symbols=None,
+            moonvest_follow=None,
+            moonvest_cursor_mode=None,
+            security_firm=None,
+            expiry_guard_enabled=None,
+            reject_nonconforming_option_ticks=None,
+            allow_unmanaged_sells=None,
+        )
+
+        settings.validate()
+
+        self.assertEqual(settings.broker, "moomoo")
+        self.assertEqual(settings.opend_host, "127.0.0.1")
+        self.assertEqual(settings.opend_port, 11111)
+        self.assertEqual(settings.allowed_markets, ["US"])
+        self.assertEqual(settings.allowed_symbols, [])
+        self.assertEqual(settings.moonvest_follow, [])
+        self.assertEqual(settings.moonvest_cursor_mode, "header")
+        self.assertEqual(settings.security_firm, "FUTUJP")
+        self.assertTrue(settings.expiry_guard_enabled)
+        self.assertTrue(settings.reject_nonconforming_option_ticks)
+        self.assertFalse(settings.allow_unmanaged_sells)
+
+    def test_nullable_settings_update_is_persisted_safely(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "settings.json"
+            store = SettingsStore(path)
+            updated = store.update({"broker": None, "allowed_markets": None})
+
+            self.assertEqual(updated.broker, "moomoo")
+            self.assertEqual(updated.allowed_markets, ["US"])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["broker"], "moomoo")
+
     def test_account_discovery_can_target_an_unsaved_broker(self):
         saved = AppSettings(broker="moomoo")
         app = Application.__new__(Application)
@@ -668,6 +971,59 @@ class SharedAppRegressionTest(unittest.TestCase):
         self.assertIn('$("#save-settings").addEventListener("click"', javascript)
         save_button = next(line for line in html.splitlines() if 'id="save-settings"' in line)
         self.assertIn('type="button"', save_button)
+
+    def test_frontend_requests_timeout_and_restore_sensitive_action_buttons(self):
+        root = Path(__file__).resolve().parents[1]
+        javascript = (root / "opend_copytrader" / "static" / "app.js").read_text(encoding="utf-8")
+        html = (root / "opend_copytrader" / "static" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn("new AbortController()", javascript)
+        self.assertIn("Promise.race([request, deadline])", javascript)
+        self.assertIn("beginButtonBusy", javascript)
+        self.assertIn('timeoutMs: 35000', javascript)
+        self.assertIn('finally {\n    finish();', javascript)
+        self.assertIn("executionBlockers", javascript)
+        self.assertIn("Moonvest SSE 重连中", javascript)
+        self.assertIn("result.authorization_url", javascript)
+        auth_link = next(line for line in html.splitlines() if 'id="robinhood-auth-link"' in line)
+        self.assertNotIn('target="_blank"', auth_link)
+
+    def test_native_shell_exposes_drag_handle_and_web_inspector(self):
+        root = Path(__file__).resolve().parents[1]
+        swift = (root / "packaging" / "MacApp.swift").read_text(encoding="utf-8")
+
+        self.assertIn("final class WindowDragHandleView", swift)
+        self.assertIn("window?.performDrag(with: event)", swift)
+        self.assertIn('configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")', swift)
+        self.assertIn("webView.isInspectable = true", swift)
+        self.assertIn("event.keyCode == 111", swift)
+
+    def test_diagnostic_export_redacts_credentials_and_account_identifiers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recorder = DiagnosticRecorder(root / "diagnostics.jsonl", export_dir=root / "exports")
+            secret = "unit_test_secret_do_not_export_this"
+            account = "998877665544"
+            recorder.record(
+                "api.failed",
+                api_key=secret,
+                error=f"Authorization: Bearer {secret}",
+                account_id=account,
+            )
+            filename, payload = recorder.archive(
+                {"settings": {"api_key": secret, "account_id": account}, "healthy": False}
+            )
+
+            self.assertTrue(filename.startswith("Moonvest-Diagnostics-"))
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                self.assertEqual(
+                    set(archive.namelist()),
+                    {"README.txt", "manifest.json", "diagnostic-context.json", "diagnostic-log.json"},
+                )
+                combined = b"\n".join(archive.read(name) for name in archive.namelist())
+            self.assertNotIn(secret.encode(), combined)
+            self.assertNotIn(account.encode(), combined)
+            self.assertIn(b"<redacted>", combined)
 
     def test_share_build_uses_bundled_ca_for_python_https(self):
         root = Path(__file__).resolve().parents[1]

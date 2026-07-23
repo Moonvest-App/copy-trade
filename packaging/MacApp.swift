@@ -2,6 +2,22 @@ import Cocoa
 import Darwin
 import WebKit
 
+final class WindowDragHandleView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            window?.zoom(nil)
+            return
+        }
+        window?.performDrag(with: event)
+    }
+}
+
 private enum MonitorLevel {
     case starting
     case healthy
@@ -30,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var brokerMenuItem: NSMenuItem!
     private var executionMenuItem: NSMenuItem!
     private var eventMenuItem: NSMenuItem!
+    private var developerKeyMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -59,6 +76,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let developerKeyMonitor {
+            NSEvent.removeMonitor(developerKeyMonitor)
+            self.developerKeyMonitor = nil
+        }
         stopBackend()
     }
 
@@ -110,6 +131,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         windowMenuItem.submenu = windowMenu
         NSApp.windowsMenu = windowMenu
+
+        let developerMenuItem = NSMenuItem()
+        mainMenu.addItem(developerMenuItem)
+        let developerMenu = NSMenu(title: "开发")
+        let inspectorItem = NSMenuItem(
+            title: "打开 Web Inspector（F12）",
+            action: #selector(showWebInspector(_:)),
+            keyEquivalent: "\u{F70F}"
+        )
+        inspectorItem.target = self
+        inspectorItem.keyEquivalentModifierMask = []
+        developerMenu.addItem(inspectorItem)
+        let inspectorFallbackItem = NSMenuItem(
+            title: "打开 Web Inspector（⌘⌥I）",
+            action: #selector(showWebInspector(_:)),
+            keyEquivalent: "i"
+        )
+        inspectorFallbackItem.target = self
+        inspectorFallbackItem.keyEquivalentModifierMask = [.command, .option]
+        developerMenu.addItem(inspectorFallbackItem)
+        developerMenuItem.submenu = developerMenu
+        developerKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // macOS virtual key code 111 is F12. Laptop users may need fn+F12.
+            if event.keyCode == 111 {
+                self?.showWebInspector(nil)
+                return nil
+            }
+            return event
+        }
         NSApp.mainMenu = mainMenu
     }
 
@@ -279,10 +329,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         return formatter.string(from: date)
     }
 
+    @objc private func showWebInspector(_ sender: Any?) {
+        let inspectorSelector = NSSelectorFromString("_inspector")
+        let showSelector = NSSelectorFromString("show")
+        guard webView.responds(to: inspectorSelector),
+              let unmanagedInspector = webView.perform(inspectorSelector) else {
+            showAlert(
+                title: "无法打开开发者工具",
+                message: "当前 macOS WebKit 不提供 Web Inspector，请改用“导出诊断包”。"
+            )
+            return
+        }
+        let inspector = unmanagedInspector.takeUnretainedValue() as AnyObject
+        guard inspector.responds(to: showSelector) else {
+            showAlert(
+                title: "无法打开开发者工具",
+                message: "当前 macOS WebKit 不支持 F12 Inspector，请改用“导出诊断包”。"
+            )
+            return
+        }
+        _ = inspector.perform(showSelector)
+    }
+
+    private func showAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
     private func createWindow() {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
         webView = WKWebView(frame: .zero, configuration: configuration)
+        if #available(macOS 13.3, *) {
+            webView.isInspectable = true
+        }
         webView.navigationDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
 
@@ -303,7 +388,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         )
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 980, height: 680)
-        window.contentView = webView
+
+        let container = NSView(frame: .zero)
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(webView)
+        let dragHandle = WindowDragHandleView(frame: .zero)
+        dragHandle.translatesAutoresizingMaskIntoConstraints = false
+        dragHandle.toolTip = "按住这里拖动窗口；双击缩放"
+        container.addSubview(dragHandle, positioned: .above, relativeTo: webView)
+        NSLayoutConstraint.activate([
+            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            webView.topAnchor.constraint(equalTo: container.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            dragHandle.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 76),
+            dragHandle.topAnchor.constraint(equalTo: container.topAnchor),
+            dragHandle.widthAnchor.constraint(equalToConstant: 150),
+            dragHandle.heightAnchor.constraint(equalToConstant: 44),
+        ])
+        window.contentView = container
         window.delegate = self
         window.center()
         window.setFrameAutosaveName("MoonvestMainWindow")

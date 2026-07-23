@@ -115,6 +115,7 @@ nav { display: flex; flex-direction: column; gap: 6px; }
   box-shadow: 0 0 14px rgba(62, 224, 160, .5);
 }
 .sidebar-foot small { color: #506077; font-size: var(--fs-micro); }
+.sidebar-foot em { margin-left: 4px; color: #61728a; font-size: var(--fs-micro); font-style: normal; }
 
 /* ---- 主区骨架与顶栏 ---- */
 
@@ -153,6 +154,8 @@ nav { display: flex; flex-direction: column; gap: 6px; }
   font-weight: 800;
 }
 .status-chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+.status-chip.pending { color: #d8be72; border-color: rgba(245, 200, 75, .18); background: var(--amber-soft); }
+.status-chip.pending i { background: var(--amber); }
 .status-chip.offline { color: #c98b8b; border-color: rgba(255, 107, 107, .15); background: var(--red-soft); }
 .status-chip.offline i { background: var(--red); }
 
@@ -182,6 +185,15 @@ nav { display: flex; flex-direction: column; gap: 6px; }
 }
 .safety-banner strong { color: #e6f7ef; font-size: var(--fs-base); }
 .safety-banner p { margin: 4px 0 0; color: #7f998e; font-size: var(--fs-note); }
+.execution-readiness {
+  display: flex; align-items: center; justify-content: space-between; gap: 18px;
+  margin: -4px 0 14px; padding: 12px 15px; border: 1px solid rgba(245, 200, 75, .2);
+  border-radius: var(--radius-sm); background: var(--amber-soft);
+}
+.execution-readiness[hidden] { display: none; }
+.execution-readiness div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.execution-readiness strong { color: #f2d988; font-size: var(--fs-small); }
+.execution-readiness span { color: #a6966e; font-size: var(--fs-note); line-height: 1.45; }
 .mode-label {
   margin-left: auto;
   color: var(--green);
@@ -558,6 +570,18 @@ tbody tr:last-child td { border-bottom: 0; }
 .oauth-actions { display: flex; flex: 0 0 auto; gap: 7px; }
 
 /* ---- 审计日志 ---- */
+
+.diagnostic-export-result {
+  padding: 10px 12px;
+  margin: -5px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: #718198;
+  background: rgba(7, 15, 29, .35);
+  font-size: var(--fs-note);
+}
+.diagnostic-export-result.ready { color: var(--green); border-color: rgba(62, 224, 160, .2); background: var(--green-soft); }
+.diagnostic-export-result.error { color: #ffc1c1; border-color: rgba(255, 107, 107, .2); background: var(--red-soft); }
 
 .event-list { display: flex; flex-direction: column; }
 .event-item {
