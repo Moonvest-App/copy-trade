@@ -103,7 +103,7 @@ class MoomooAdapter:
 
     @staticmethod
     def _firm(name: str) -> str:
-        key = name.strip().upper()
+        key = str(name or "").strip().upper()
         if key not in VALID_FIRMS:
             raise OpenDError(f"未知券商区域：{key}")
         return getattr(SecurityFirm, key)

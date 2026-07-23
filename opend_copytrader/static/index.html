@@ -17,13 +17,14 @@
       <button type="button" class="nav-item" data-view="settings"><span>⚙</span>连接与风控</button>
       <button type="button" class="nav-item" data-view="events"><span>≡</span>审计日志</button>
     </nav>
-    <div class="sidebar-foot"><i></i><span>本机运行<br><small>密钥存入登录钥匙串</small></span></div>
+    <div class="sidebar-foot"><i></i><span>本机运行 <em id="app-version">v—</em><br><small>密钥存入登录钥匙串</small></span></div>
   </aside>
 
   <main class="main">
     <header class="topbar">
       <div><p id="page-eyebrow" class="eyebrow">MOONVEST ACTIVE TRADES</p><h1 id="page-title">跟单总览</h1></div>
       <div class="top-actions">
+        <div id="source-chip" class="status-chip pending"><i></i><span>正在检查 Moonvest SSE</span></div>
         <div id="connection-chip" class="status-chip pending"><i></i><span>正在检查券商 API</span></div>
         <button id="pause-button" class="btn ghost">暂停</button>
         <button id="arm-button" class="btn primary">启用执行</button>
@@ -35,6 +36,11 @@
         <div class="shield">◇</div>
         <div><strong>默认安全模式</strong><p>当前只记录与评估 Moonvest 事件，不会提交订单。</p></div>
         <span id="mode-label" class="mode-label">仅观察</span>
+      </div>
+
+      <div id="execution-readiness" class="execution-readiness" hidden>
+        <div><strong>执行尚未就绪</strong><span id="execution-readiness-detail">请检查信息源、券商账户和风控设置。</span></div>
+        <button type="button" class="btn ghost" data-view-jump="settings">检查前置条件</button>
       </div>
 
       <div class="stat-grid">
@@ -132,6 +138,7 @@
                 <div class="oauth-actions"><button id="connect-robinhood" type="button" class="btn primary">连接 Robinhood</button><button id="disconnect-robinhood" type="button" class="btn text-danger">断开</button></div>
               </div>
               <div id="robinhood-auth-status" class="detail-box">尚未连接</div>
+              <a id="robinhood-auth-link" class="doc-link" href="#" rel="noreferrer" hidden>没有自动打开浏览器？点击这里继续授权 ↗</a>
             </div>
             <div class="broker-config" data-broker-config="ibkr"><div class="form-grid"><label class="field"><span>Gateway 主机</span><input name="ibkr_host" value="127.0.0.1" readonly></label><label class="field"><span>Gateway HTTPS 端口</span><input name="ibkr_port" type="number" min="1" max="65535"></label></div></div>
             <div class="broker-config" data-broker-config="webull">
@@ -173,7 +180,8 @@
     </section>
 
     <section id="view-events" class="view">
-      <div class="view-head"><div><h2>审计日志</h2><p>连接、游标、去重、风控、执行开关与订单结果均落盘在本机。</p></div><button id="refresh-events" class="btn ghost">刷新日志</button></div>
+      <div class="view-head"><div><h2>审计日志</h2><p>连接、游标、去重、风控、执行开关与订单结果均落盘在本机。</p></div><div class="panel-actions"><button id="export-diagnostics" class="btn ghost">导出诊断包</button><button id="refresh-events" class="btn ghost">刷新日志</button></div></div>
+      <div id="diagnostic-export-result" class="diagnostic-export-result">诊断包会脱敏后保存到“下载”文件夹，不包含 API key、券商凭证、账户号或持仓明细。</div>
       <article class="panel"><div id="event-list" class="event-list"></div></article>
     </section>
   </main>

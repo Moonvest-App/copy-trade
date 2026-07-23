@@ -14,6 +14,9 @@ OPEN_OPTION_RE = re.compile(
 OCC_RE = re.compile(
     r"^(?P<root>[A-Z0-9 ]{1,6})(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})$"
 )
+POLYGON_OPTION_RE = re.compile(
+    r"^O:(?P<root>[A-Z0-9]{1,6})(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})$"
+)
 EASTERN = ZoneInfo("America/New_York")
 
 BROKER_EXPIRY_NOTES = {
@@ -86,8 +89,11 @@ class OptionContract:
 def parse_option_contract(code: str, instrument: dict[str, Any] | None = None) -> OptionContract | None:
     raw_occ = str((instrument or {}).get("occ") or "").strip().upper()
     match = OCC_RE.fullmatch(raw_occ) if raw_occ else None
+    if match is None and raw_occ:
+        match = POLYGON_OPTION_RE.fullmatch(raw_occ)
     if match is None:
-        match = OPEN_OPTION_RE.fullmatch(str(code or "").strip().upper())
+        raw_code = str(code or "").strip().upper()
+        match = OPEN_OPTION_RE.fullmatch(raw_code) or POLYGON_OPTION_RE.fullmatch(raw_code)
     if match is None:
         return None
     expiry = datetime.strptime(match.group("expiry"), "%y%m%d").date()
@@ -109,6 +115,10 @@ def broker_symbol(broker: str, code: str, instrument: dict[str, Any] | None = No
         return contract.to_moomoo()
     if broker == "schwab":
         return contract.to_occ()
+    if broker == "robinhood":
+        # Keep canonical option fields intact until the MCP adapter resolves
+        # the exact Robinhood instrument UUID.
+        return contract.to_moomoo()
     if broker == "webull" and contract.is_spx_family:
         raise ValueError("Webull OpenAPI 官方范围不含指数期权，不能把 SPX/SPXW 当作普通股票期权发送")
     if broker == "ibkr":

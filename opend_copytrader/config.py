@@ -23,6 +23,11 @@ VALID_BROKERS = {"moomoo", "ibkr", "webull", "schwab", "robinhood"}
 FOLLOW_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 
 
+def _text(value: Any, default: str = "") -> str:
+    """Normalize nullable persisted/API string values before validation."""
+    return default if value is None else str(value)
+
+
 def default_data_dir() -> Path:
     override = os.environ.get("MOONVEST_DATA_DIR", "").strip()
     if override:
@@ -67,42 +72,62 @@ class AppSettings:
     moonvest_cursor_mode: str = "header"  # header | since
 
     def validate(self) -> None:
-        self.broker = self.broker.strip().lower()
+        self.broker = _text(self.broker, "moomoo").strip().lower()
         if self.broker not in VALID_BROKERS:
             raise ValueError("券商只能选择 moomoo、Robinhood、IBKR、Webull 或嘉信")
-        self.opend_host = self.opend_host.strip()
+        self.opend_host = _text(self.opend_host, "127.0.0.1").strip()
         if self.opend_host not in {"127.0.0.1", "localhost"}:
             raise ValueError("为保证本地安全，OpenD 主机只能是 127.0.0.1 或 localhost")
+        if self.opend_port is None:
+            self.opend_port = 11111
         if not 1 <= int(self.opend_port) <= 65535:
             raise ValueError("OpenD 端口无效")
-        self.ibkr_host = self.ibkr_host.strip().lower()
+        self.ibkr_host = _text(self.ibkr_host, "127.0.0.1").strip().lower()
         if self.ibkr_host not in {"127.0.0.1", "localhost"}:
             raise ValueError("为防止会话泄露，IBKR Client Portal Gateway 只能连接本机")
+        if self.ibkr_port is None:
+            self.ibkr_port = 5000
         if not 1 <= int(self.ibkr_port) <= 65535:
             raise ValueError("IBKR Gateway 端口无效")
-        self.ibkr_account_id = self.ibkr_account_id.strip()
-        self.webull_environment = self.webull_environment.strip().lower()
+        self.ibkr_account_id = _text(self.ibkr_account_id).strip()
+        self.webull_environment = _text(self.webull_environment, "production").strip().lower()
         if self.webull_environment not in {"production", "sandbox"}:
             raise ValueError("Webull 环境只能是 production 或 sandbox")
-        self.webull_account_id = self.webull_account_id.strip()
-        self.webull_app_key = self.webull_app_key.strip()
-        self.schwab_account_hash = self.schwab_account_hash.strip()
-        self.schwab_client_id = self.schwab_client_id.strip()
-        self.schwab_callback_url = self.schwab_callback_url.strip()
-        self.robinhood_account_id = self.robinhood_account_id.strip()
+        self.webull_account_id = _text(self.webull_account_id).strip()
+        self.webull_app_key = _text(self.webull_app_key).strip()
+        self.schwab_account_hash = _text(self.schwab_account_hash).strip()
+        self.schwab_client_id = _text(self.schwab_client_id).strip()
+        self.schwab_callback_url = _text(self.schwab_callback_url, "https://127.0.0.1").strip()
+        self.robinhood_account_id = _text(self.robinhood_account_id).strip()
         if self.schwab_callback_url and not self.schwab_callback_url.startswith(
             ("https://", "http://127.0.0.1", "http://localhost")
         ):
             raise ValueError("嘉信回调地址必须使用 HTTPS，或明确指向本机")
-        self.security_firm = self.security_firm.strip().upper()
+        self.security_firm = _text(self.security_firm, "FUTUJP").strip().upper()
         if self.security_firm not in VALID_FIRMS:
             raise ValueError("券商区域标识无效")
-        self.trading_env = self.trading_env.strip().upper()
+        self.trading_env = _text(self.trading_env, "SIMULATE").strip().upper()
         if self.trading_env not in {"SIMULATE", "REAL"}:
             raise ValueError("交易环境只能是 SIMULATE 或 REAL")
-        self.mode = self.mode.strip().lower()
+        self.mode = _text(self.mode, "observe").strip().lower()
         if self.mode not in {"observe", "confirm", "auto"}:
             raise ValueError("执行模式只能是 observe、confirm 或 auto")
+        if self.copy_ratio is None:
+            self.copy_ratio = 1.0
+        if self.max_order_notional is None:
+            self.max_order_notional = 1_000.0
+        if self.max_daily_notional is None:
+            self.max_daily_notional = 5_000.0
+        if self.max_slippage_pct is None:
+            self.max_slippage_pct = 3.0
+        if self.expiry_guard_enabled is None:
+            self.expiry_guard_enabled = True
+        if self.expiry_open_cutoff_minutes is None:
+            self.expiry_open_cutoff_minutes = 60
+        if self.reject_nonconforming_option_ticks is None:
+            self.reject_nonconforming_option_ticks = True
+        if self.allow_unmanaged_sells is None:
+            self.allow_unmanaged_sells = False
         if not 0 < float(self.copy_ratio) <= 1:
             raise ValueError("跟单比例必须大于 0% 且不超过 100%")
         if float(self.max_order_notional) <= 0 or float(self.max_daily_notional) <= 0:
@@ -111,18 +136,23 @@ class AppSettings:
             raise ValueError("最大滑点必须在 0% 到 100% 之间")
         if not 15 <= int(self.expiry_open_cutoff_minutes) <= 240:
             raise ValueError("到期日前禁止开仓窗口必须在 15 到 240 分钟之间")
+        if self.allowed_markets is not None and not isinstance(self.allowed_markets, list):
+            raise ValueError("允许市场配置必须是列表")
+        if self.allowed_symbols is not None and not isinstance(self.allowed_symbols, list):
+            raise ValueError("允许标的配置必须是列表")
+        allowed_markets = ["US"] if self.allowed_markets is None else self.allowed_markets
         self.allowed_markets = sorted(
-            {str(value).strip().upper() for value in self.allowed_markets if str(value).strip()}
+            {str(value).strip().upper() for value in allowed_markets if str(value).strip()}
         )
         self.allowed_symbols = sorted(
-            {str(value).strip().upper() for value in self.allowed_symbols if str(value).strip()}
+            {str(value).strip().upper() for value in (self.allowed_symbols or []) if str(value).strip()}
         )
-        self.base_currency = self.base_currency.strip().upper() or "USD"
-        self.us_session = self.us_session.strip().upper() or "RTH"
-        self.moonvest_cursor_mode = self.moonvest_cursor_mode.strip().lower()
+        self.base_currency = _text(self.base_currency, "USD").strip().upper() or "USD"
+        self.us_session = _text(self.us_session, "RTH").strip().upper() or "RTH"
+        self.moonvest_cursor_mode = _text(self.moonvest_cursor_mode, "header").strip().lower()
         if self.moonvest_cursor_mode not in {"header", "since"}:
             raise ValueError("游标传递方式只能是 Last-Event-ID 或 since")
-        self.moonvest_follow = self._validated_follows(self.moonvest_follow)
+        self.moonvest_follow = self._validated_follows(self.moonvest_follow or [])
 
     @staticmethod
     def _validated_follows(values: Any) -> list[str]:

@@ -5,13 +5,13 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from ..config import AppSettings
 from ..instruments import broker_expiry_policy, broker_symbol
 from ..models import Quote
 from ..moomoo_adapter import MoomooAdapter, OpenDError
-from ..robinhood_mcp import RobinhoodMCPAdapter
+from ..robinhood_mcp import RobinhoodMCPAdapter, RobinhoodOrderRejected
 from .base import BROKER_LABELS, BrokerError, to_number
 from .ibkr import IBKRClientPortalAdapter
 from .keychain import KeychainStore
@@ -27,13 +27,13 @@ class BrokerRouter:
         "schwab": ("client_secret", "access_token", "refresh_token"),
     }
 
-    def __init__(self) -> None:
+    def __init__(self, *, diagnostic: Callable[..., None] | None = None) -> None:
         self.keychain = KeychainStore()
         self.moomoo = MoomooAdapter()
         self.ibkr = IBKRClientPortalAdapter()
         self.webull = WebullAdapter(self.keychain)
         self.schwab = SchwabAdapter(self.keychain)
-        self.robinhood = RobinhoodMCPAdapter(self.keychain)
+        self.robinhood = RobinhoodMCPAdapter(self.keychain, diagnostic=diagnostic)
         self._health_lock = threading.RLock()
         self._health_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._data_lock = threading.RLock()
@@ -41,6 +41,10 @@ class BrokerRouter:
 
     def _adapter(self, settings: AppSettings) -> Any:
         return getattr(self, settings.broker)
+
+    @staticmethod
+    def _health_key(settings: AppSettings) -> str:
+        return f"{settings.broker}:{settings.opend_host}:{settings.opend_port}:{settings.ibkr_host}:{settings.ibkr_port}:{settings.webull_environment}:{settings.webull_app_key}:{settings.schwab_client_id}:{settings.robinhood_account_id}"
 
     def capabilities(self, settings: AppSettings) -> dict[str, Any]:
         if settings.broker == "moomoo":
@@ -56,17 +60,20 @@ class BrokerRouter:
                 "status": "完整接入 · 推送优先",
             }
         if settings.broker == "robinhood":
-            execution, status = self.robinhood.execution_status()
+            capability = self.robinhood.execution_capability(settings)
             return {
                 "accounts": True,
                 "portfolio": True,
                 "quotes": True,
                 "orders": True,
-                "execution": execution,
+                "execution": bool(capability["execution"]),
+                "execution_assets": list(capability.get("assets") or []),
+                "agentic_account": bool(capability.get("agentic")),
+                "execution_prerequisites": dict(capability.get("prerequisites") or {}),
                 "leader_mirror": False,
                 "streaming": False,
                 "transport": "Robinhood 官方 Trading MCP · OAuth 2.1 / Streamable HTTP",
-                "status": status,
+                "status": str(capability["status"]),
             }
         labels = {
             "ibkr": "已接入 Gateway 账户、持仓、订单与股票快照；订单确认回复链路尚未开放",
@@ -90,7 +97,7 @@ class BrokerRouter:
         }
 
     def health(self, settings: AppSettings) -> dict[str, Any]:
-        key = f"{settings.broker}:{settings.opend_host}:{settings.opend_port}:{settings.ibkr_host}:{settings.ibkr_port}:{settings.webull_environment}:{settings.webull_app_key}:{settings.schwab_client_id}:{settings.robinhood_account_id}"
+        key = self._health_key(settings)
         with self._health_lock:
             cached = self._health_cache.get(key)
             if cached and time.monotonic() - cached[0] < 45:
@@ -123,9 +130,28 @@ class BrokerRouter:
             self._health_cache = {key: (time.monotonic(), dict(result))}
         return result
 
+    def monitor_health(self, settings: AppSettings) -> dict[str, Any]:
+        """Return only cached health so diagnostics never makes a broker request."""
+        key = self._health_key(settings)
+        with self._health_lock:
+            cached = self._health_cache.get(key)
+            if cached:
+                checked_at, payload = cached
+                result = dict(payload)
+                result["checked"] = True
+                result["stale"] = time.monotonic() - checked_at >= 45
+                return result
+        return {
+            "broker": settings.broker,
+            "broker_label": BROKER_LABELS[settings.broker],
+            "connected": False,
+            "checked": False,
+            "stale": True,
+        }
+
     def execution_status(self, settings: AppSettings) -> tuple[bool, str]:
         if settings.broker == "robinhood":
-            return self.robinhood.execution_status()
+            return self.robinhood.execution_status(settings)
         capabilities = self.capabilities(settings)
         return bool(capabilities["execution"]), str(capabilities["status"])
 
@@ -236,4 +262,9 @@ class BrokerRouter:
             # rejections (unsupported session, locked trading, invalid order,
             # etc.). Normalize it so one rejected order does not trip the
             # engine's unknown-failure circuit breaker.
+            raise BrokerError(str(exc)) from exc
+        except RobinhoodOrderRejected as exc:
+            # A definite review/schema/broker rejection is scoped to this
+            # order. Ambiguous place responses remain unhandled here and trip
+            # the engine's fail-closed circuit breaker.
             raise BrokerError(str(exc)) from exc

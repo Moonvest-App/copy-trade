@@ -95,10 +95,10 @@ class CopyEngine:
             raise ValueError("实盘启用前必须确认已在 OpenD GUI 中手动解锁交易")
         with self._lock:
             self._paused = False
-            self._armed_until = datetime.now(timezone.utc) + timedelta(hours=4)
+            self._armed_until = datetime.now(timezone.utc) + timedelta(hours=8)
         self.store.event(
             "engine.arm",
-            f"订单执行已启用（{settings.trading_env}，4 小时后自动关闭）",
+            f"订单执行已启用（{settings.trading_env}，8 小时后自动关闭）",
             level="warning" if settings.trading_env == "REAL" else "info",
         )
         return self.state()
@@ -365,15 +365,17 @@ class CopyEngine:
                 )
         idempotency_key = hashlib.sha256(signal.external_id.encode("utf-8")).hexdigest()[:20]
         try:
-            result = self.broker.place_order(
-                settings,
-                code=broker_code,
-                side=signal.side,
-                quantity=decision.quantity,
-                price=decision.execution_price,
-                order_type=signal.order_type,
-                remark=f"mv-{idempotency_key}",
-            )
+            order_kwargs: dict[str, Any] = {
+                "code": broker_code,
+                "side": signal.side,
+                "quantity": decision.quantity,
+                "price": decision.execution_price,
+                "order_type": signal.order_type,
+                "remark": f"mv-{idempotency_key}",
+            }
+            if settings.broker == "robinhood":
+                order_kwargs["action"] = signal.action
+            result = self.broker.place_order(settings, **order_kwargs)
             row = self.store.update_signal(
                 signal_id,
                 copied_quantity=decision.quantity,

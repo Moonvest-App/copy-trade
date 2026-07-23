@@ -5,6 +5,7 @@ import mimetypes
 import signal
 import socket
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http import HTTPStatus
@@ -12,8 +13,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .broker_adapters import BrokerRouter
 from .config import SettingsStore
+from .diagnostics import DiagnosticRecorder
 from .engine import CopyEngine
 from .moonvest import MoonvestCredentials, MoonvestStream
 from .store import LocalStore
@@ -27,7 +30,11 @@ class Application:
     def __init__(self, *, settings_path: Path | None = None, database_path: Path | None = None):
         self.settings = SettingsStore(settings_path)
         self.store = LocalStore(database_path)
-        self.adapter = BrokerRouter()
+        diagnostic_path = (
+            settings_path.with_name("diagnostics.jsonl") if settings_path is not None else None
+        )
+        self.diagnostics = DiagnosticRecorder(diagnostic_path)
+        self.adapter = BrokerRouter(diagnostic=self.diagnostics.record)
         self.engine = CopyEngine(self.settings, self.store, self.adapter)
         self.moonvest_credentials = MoonvestCredentials(self.adapter.keychain)
         self.moonvest_stream = MoonvestStream(
@@ -36,10 +43,13 @@ class Application:
             self.engine,
             self.moonvest_credentials,
             resync_handler=self._broker_resync_snapshot,
+            diagnostic=self.diagnostics.record,
         )
         self.moonvest_stream.start()
+        self.diagnostics.record("application.started", app_version=__version__)
 
     def close(self) -> None:
+        self.diagnostics.record("application.stopping")
         self.moonvest_stream.stop()
         self.adapter.close()
         self.store.close()
@@ -64,6 +74,7 @@ class Application:
     def dashboard(self) -> dict[str, Any]:
         settings = self.settings.get()
         return {
+            "app_version": __version__,
             "health": self.adapter.health(settings),
             "settings": settings.public_dict(),
             "engine": self.engine.state(),
@@ -73,6 +84,69 @@ class Application:
             "signals": self.store.list_signals(60),
             "events": self.store.list_events(50),
         }
+
+    def diagnostic_context(self) -> dict[str, Any]:
+        """Build a support snapshot without making a new broker request."""
+        settings = self.settings.get()
+        health = self.adapter.monitor_health(settings)
+        moonvest = self.moonvest_stream.status()
+        health_keys = {
+            "broker",
+            "broker_label",
+            "connected",
+            "authenticated",
+            "endpoint",
+            "error",
+            "checked",
+            "stale",
+            "sdk_version",
+            "credential_status",
+            "rate_limit",
+            "stream",
+            "capabilities",
+        }
+        moonvest_keys = {
+            "connected",
+            "last_error",
+            "last_event_at",
+            "reconnect_count",
+            "resync_count",
+            "resync_required",
+            "api_key_configured",
+            "credential_source",
+            "cursor_mode",
+        }
+        return {
+            "app_version": __version__,
+            "settings": {
+                "broker": settings.broker,
+                "trading_env": settings.trading_env,
+                "mode": settings.mode,
+                "follow_count": len(settings.moonvest_follow),
+                "account_configured": bool(settings.selected_account_id()),
+                "allowed_market_count": len(settings.allowed_markets),
+                "allowed_symbol_count": len(settings.allowed_symbols),
+            },
+            "broker_health": {key: health.get(key) for key in health_keys if key in health},
+            "engine": self.engine.state(),
+            "moonvest_stream": {
+                key: moonvest.get(key) for key in moonvest_keys if key in moonvest
+            },
+            "recent_events": [
+                {
+                    "created_at": event.get("created_at"),
+                    "level": event.get("level"),
+                    "kind": event.get("kind"),
+                    "message": event.get("message"),
+                }
+                for event in self.store.list_events(200)
+            ],
+        }
+
+    def export_diagnostics(self) -> dict[str, Any]:
+        result = self.diagnostics.export(self.diagnostic_context())
+        self.diagnostics.record("diagnostics.exported", **result)
+        return result
 
     def discover_accounts(self, broker: str | None = None) -> list[dict[str, Any]]:
         """Discover accounts for the broker currently selected in the UI.
@@ -85,6 +159,28 @@ class Application:
         settings.broker = str(broker or settings.broker).strip().lower()
         settings.validate()
         return self.adapter.accounts(settings)
+
+    def arm_engine(self, *, manual_unlock_confirmed: bool = False) -> dict[str, Any]:
+        """Only arm while the sole source is configured and continuously live."""
+        settings = self.settings.get()
+        if not self.moonvest_credentials.api_key():
+            raise ValueError("请先配置 Moonvest API key")
+        if not settings.moonvest_follow:
+            raise ValueError("请先配置至少一个 Moonvest follow 用户")
+        stream = self.moonvest_stream.status()
+        if bool(stream.get("resync_required")):
+            raise ValueError("Moonvest SSE 刚发生 resync，请先核对券商持仓再启用执行")
+        if not bool(stream.get("connected")):
+            detail = str(stream.get("last_error") or "SSE 尚未建立连续实时连接")
+            raise ValueError(f"Moonvest SSE 未就绪，不能启用执行：{detail}")
+        # Explicitly refresh the broker probe at the moment of arming instead
+        # of trusting a dashboard cache that can be up to 45 seconds old.
+        self.adapter.invalidate()
+        health = self.adapter.health(settings)
+        if not bool(health.get("connected")):
+            detail = str(health.get("error") or "券商连接尚未就绪")
+            raise ValueError(f"券商连接未就绪，不能启用执行：{detail}")
+        return self.engine.arm(manual_unlock_confirmed=manual_unlock_confirmed)
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -125,8 +221,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return self._static(path)
             return handler(self, query)
         except ValueError as exc:
+            self.app.diagnostics.record(
+                "api.get.failed", path=path, error=str(exc), error_type=type(exc).__name__
+            )
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
+            self.app.diagnostics.record(
+                "api.get.failed", path=path, error=str(exc), error_type=type(exc).__name__
+            )
             return self._json({"error": str(exc)}, HTTPStatus.SERVICE_UNAVAILABLE)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -135,6 +237,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self.headers.get("X-Local-App") != LOCAL_HEADER:
             return self._json({"error": "缺少本地应用请求头"}, HTTPStatus.FORBIDDEN)
         path = urllib.parse.urlparse(self.path).path
+        started = time.monotonic()
         try:
             payload = self._body()
             handler = self.POST_ROUTES.get(path)
@@ -149,8 +252,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return self._json({"signal": self.app.engine.reject(signal_id, reason)})
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except ValueError as exc:
+            self.app.diagnostics.record(
+                "api.post.failed",
+                path=path,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
+            self.app.diagnostics.record(
+                "api.post.failed",
+                path=path,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             return self._json({"error": str(exc)}, HTTPStatus.SERVICE_UNAVAILABLE)
 
     def do_PUT(self) -> None:  # noqa: N802
@@ -159,6 +276,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if self.headers.get("X-Local-App") != LOCAL_HEADER:
             return self._json({"error": "缺少本地应用请求头"}, HTTPStatus.FORBIDDEN)
         path = urllib.parse.urlparse(self.path).path
+        started = time.monotonic()
         try:
             if path != "/api/settings":
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -169,8 +287,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.app.store.event("settings.updated", "设置已保存，订单执行已自动关闭")
             return self._json(settings.public_dict())
         except ValueError as exc:
+            self.app.diagnostics.record(
+                "api.put.failed",
+                path=path,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             return self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
+            self.app.diagnostics.record(
+                "api.put.failed",
+                path=path,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             return self._json({"error": str(exc)}, HTTPStatus.SERVICE_UNAVAILABLE)
 
     # ---- GET 端点 ----
@@ -263,8 +395,14 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _post_oauth_start(self, payload: dict[str, Any]) -> None:
         authorization_url = self.app.adapter.robinhood_authorization_url()
-        opened = webbrowser.open(authorization_url)
-        return self._json({"started": bool(opened)})
+        opened = webbrowser.open(authorization_url, new=2, autoraise=True)
+        return self._json(
+            {
+                "started": True,
+                "opened_external": bool(opened),
+                "authorization_url": authorization_url,
+            }
+        )
 
     def _post_oauth_disconnect(self, payload: dict[str, Any]) -> None:
         self.app.adapter.disconnect_robinhood()
@@ -273,10 +411,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         return self._json({"connected": False})
 
     def _post_engine_arm(self, payload: dict[str, Any]) -> None:
-        if not self.app.moonvest_credentials.api_key():
-            raise ValueError("请先配置 Moonvest API key")
         return self._json(
-            self.app.engine.arm(
+            self.app.arm_engine(
                 manual_unlock_confirmed=bool(payload.get("manual_unlock_confirmed"))
             )
         )
@@ -301,6 +437,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "broker.credentials_saved", f"已将 {broker} API 凭证保存到 macOS 钥匙串"
             )
         return self._json({"broker": broker, "status": status})
+
+    def _post_diagnostics_export(self, payload: dict[str, Any]) -> None:
+        return self._json(self.app.export_diagnostics())
 
     GET_ROUTES = {
         "/api/robinhood/oauth/callback": _get_oauth_callback,
@@ -329,6 +468,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         "/api/engine/disarm": _post_engine_disarm,
         "/api/engine/pause": _post_engine_pause,
         "/api/broker/credentials": _post_broker_credentials,
+        "/api/diagnostics/export": _post_diagnostics_export,
     }
 
     def _body(self) -> dict[str, Any]:

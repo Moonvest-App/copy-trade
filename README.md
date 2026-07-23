@@ -35,7 +35,7 @@ Accept: text/event-stream
 | `edited` | `EDIT` | 完整留痕并更新来源状态，不产生券商订单 |
 | `expired` | `EXPIRE` | 完整留痕并更新来源状态，不产生券商订单 |
 
-股票与单腿期权可以进入 moomoo 执行层；Robinhood 当前只执行美股与 ETF。`vertical` 组合的两条 leg 会完整保存并展示，但当前券商执行层没有原子组合单能力，因此只记录，不拆成可能失真的两张独立订单。
+股票与单腿期权可以进入 moomoo 或 Robinhood Agentic 执行层。`vertical` 组合的两条 leg 会完整保存并展示，但当前券商执行层没有原子组合单能力，因此只记录，不拆成可能失真的两张独立订单。
 
 事件中的 `subscriber_only`、`note`、`changes`、`entry_price`、`exit_price`、`realized_pnl`、到期日和 legs 都保存在原始事件 JSON 中。App 不尝试绕过 Moonvest 的订阅者权限；服务端未投递的事件在本机不可见。
 
@@ -45,10 +45,10 @@ Accept: text/event-stream
 - macOS 屏幕顶栏提供常驻状态监控，可查看 SSE、券商连接、订单执行和最近事件，并可重新打开主窗口或明确退出。
 - 默认配置是 `SIMULATE + observe`，即模拟盘 + 仅观察。
 - 订单执行开关只保存在内存；重启、暂停、保存设置、SSE 断线、resync 或未知下单异常都会关闭。券商明确拒绝某一笔订单时只拒绝该笔，后续订单继续运行。
-- 执行开关启用 4 小时后自动过期。
+- 执行开关启用 8 小时后自动过期。
 - 实盘 moomoo 必须由用户在 OpenD GUI 中手动解锁；项目不调用 `unlock_trade`。
 - Robinhood 只通过官方 OAuth 2.1 + PKCE 授权，密码和 2FA 不经过 Moonvest；token 只保存在 macOS 登录钥匙串。
-- Robinhood 下单固定先调用官方 `review_equity_order`，成功后才允许调用 `place_equity_order`。
+- Robinhood 股票和单腿期权都固定执行 schema 驱动的 `review → place`；稳定 `ref_id` 用于幂等，预审或明确拒单只隔离该笔，真实下单结果不明确时会关闭后续执行。
 - 默认禁止超出当前可卖数量的卖单；建立空头必须显式开启相应选项。
 - 每笔事件仍需通过允许市场/代码、统一跟单比例、滑点、单笔金额、单日金额和期权到期护栏。
 - 所有网络状态、游标控制、风控结果、确认动作和订单结果进入本机审计日志。
@@ -59,7 +59,7 @@ Accept: text/event-stream
 | 券商 | 端点 | 当前能力 |
 | --- | --- | --- |
 | moomoo OpenD | 本机 `127.0.0.1:11111` | 账户、持仓、订单、行情、下单 |
-| Robinhood | 官方 Trading MCP / OAuth | 全账户只读；独立 Agentic 账户可执行美股与 ETF |
+| Robinhood | 官方 Trading MCP / OAuth | 全账户只读；独立 Agentic 账户可执行美股、ETF 与单腿期权 |
 | IBKR | 本机 Client Portal Gateway | 账户、持仓、订单、美股快照；只读 |
 | Webull | 官方 HTTPS | 签名认证、账户、余额、持仓、订单；只读 |
 | Charles Schwab | 官方 HTTPS / OAuth | 账户、持仓、订单、美股快照；只读 |
@@ -96,7 +96,14 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖 SSE 帧解析、keepalive、六种 action、cursor 两种传递方式、持久去重、单腿/vertical 映射、resync、钥匙串边界、Robinhood Streamable HTTP、Agentic 账户筛选、预检/下单顺序、执行风控与下游幂等标识。
+测试覆盖 SSE 帧解析、keepalive、六种 action、cursor 两种传递方式、持久去重、坏事件隔离、断线联锁、单腿/vertical 映射、resync、钥匙串边界、Robinhood Streamable HTTP、嵌套 Agentic 账户识别、股票/期权预检与下单、明确拒单/不明确结果分流、执行风控与下游幂等标识。
+
+## 调试与诊断
+
+- 在“审计日志”页面点击“导出诊断包”，会把脱敏 ZIP 保存到“下载”文件夹。
+- 诊断包不包含 Moonvest API key、券商凭证、OAuth 令牌、账户号、订单号、持仓明细或原始配置文件。
+- macOS 原生 App 可按 `F12` 或 `⌘⌥I` 打开 Web Inspector；也可以从“开发”菜单打开。
+- 前端本机 API 请求有硬超时，按钮在成功、失败或超时后都会恢复，避免界面长期停在连接中。
 
 ## 构建 macOS App
 
@@ -121,6 +128,6 @@ open "dist/Moonvest.app"
 
 ## 当前边界
 
-- 可执行层覆盖 moomoo OpenD 股票和单腿期权，以及 Robinhood Agentic 美股/ETF；Robinhood 期权和 vertical 组合仅完整记录。
+- 可执行层覆盖 moomoo OpenD 股票和单腿期权，以及 Robinhood Agentic 美股/ETF 与单腿期权；vertical 组合仅完整记录。
 - `resync` 时给定的 SSE 合约没有来源侧快照端点，因此 App 会把旧来源状态标记为待同步，并以券商持仓快照作为执行安全基线；用户核对前执行保持关闭。
 - Moonvest 首次无 cursor 连接只接收连接后的事件，不回放历史。
